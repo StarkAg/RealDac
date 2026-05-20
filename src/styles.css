@@ -601,7 +601,9 @@ button, input, textarea, select { font: inherit; }
   background: transparent;
   color: transparent;
   caret-color: transparent;
-  font-size: 1px;
+  /* iOS Safari zooms the viewport when any focused input has font-size < 16px.
+     Text is rendered transparent so the visible size is unaffected. */
+  font-size: 16px;
   letter-spacing: 1ch;
   z-index: 2;
   cursor: text;
@@ -2097,4 +2099,19 @@ button, input, textarea, select { font: inherit; }
 .rd-tap-overlay-text small {
   font-size: 12px;
   color: var(--ink-muted);
+}
+
+/* iOS auto-zoom guard: any focused input < 16px causes Safari to zoom in.
+   Force 16px on every focusable text-like control. Pinch-to-zoom still works. */
+input[type="text"],
+input[type="number"],
+input[type="email"],
+input[type="search"],
+input[type="tel"],
+input[type="url"],
+input[type="password"],
+input:not([type]),
+select,
+textarea {
+  font-size: 16px;
 }
