@@ -242,6 +242,10 @@ export default function RealDac() {
   }, [searchParams, urlRoomCode]);
 
   const autoJoinAttempted = useRef(false);
+  // Browser autoplay policy: AudioContext can't be resumed without a user gesture.
+  // We stash a pending playState here and run it on the first tap/click/keypress.
+  const pendingRecoveryRef = useRef(null);
+  const [awaitingTap, setAwaitingTap] = useState(false);
   const [trackPickerOpen, setTrackPickerOpen] = useState(false);
   const trackPickerRef = useRef(null);
 
@@ -875,15 +879,26 @@ export default function RealDac() {
             setSyncTotalParticipants(res.participants || 1);
 
             if (res.playState?.track) {
-              try {
-                const recovered = await recoverRoomPlayback(res.playState, { status: 'Catching up…' });
-                if (!recovered) {
-                  setRoomStatus('Ready');
-                  setSyncPhase('idle');
+              // Same autoplay-gesture guard as auto-join: only run recovery
+              // immediately if the user has already interacted (audio context
+              // is in 'running' state); otherwise defer.
+              const ctx = audioCtxRef.current;
+              if (ctx && ctx.state === 'running') {
+                try {
+                  const recovered = await recoverRoomPlayback(res.playState, { status: 'Catching up…' });
+                  if (!recovered) {
+                    setRoomStatus('Ready');
+                    setSyncPhase('idle');
+                  }
+                } catch (e) {
+                  console.error('[RealDac] Failed to rebuild playback after reconnect:', e);
+                  setRoomStatus('Rejoin sync failed');
                 }
-              } catch (e) {
-                console.error('[RealDac] Failed to rebuild playback after reconnect:', e);
-                setRoomStatus('Rejoin sync failed');
+              } else {
+                pendingRecoveryRef.current = res.playState;
+                setAwaitingTap(true);
+                setRoomStatus('Tap to start');
+                setSyncPhase('idle');
               }
             } else {
               authoritativePlaybackRef.current = null;
@@ -1299,16 +1314,12 @@ export default function RealDac() {
         const albumWithTrack = albums.find((a) => a.songs?.some((s) => s.id === track));
         const albumId = albumWithTrack?.id ?? FALLBACK_ALBUM.id;
         await enterRoom(res.roomCode, participantCount, { track, album: albumId });
-        try {
-          const recovered = await recoverRoomPlayback(res.playState, { status: 'Catching up…' });
-          if (!recovered) {
-            setRoomStatus('Ready');
-            setSyncPhase('idle');
-          }
-        } catch (e) {
-          console.error('[RealDac] Failed to auto-sync room playback:', e);
-          setRoomStatus('Sync failed');
-        }
+        // DEFER recovery until first user gesture — browsers (esp. iOS Safari)
+        // require a tap before AudioContext.resume() is allowed.
+        pendingRecoveryRef.current = res.playState;
+        setAwaitingTap(true);
+        setRoomStatus('Tap to start');
+        setSyncPhase('idle');
       } else {
         await enterRoom(res.roomCode, participantCount);
         authoritativePlaybackRef.current = null;
@@ -1316,6 +1327,44 @@ export default function RealDac() {
       }
     });
   }, [urlRoomCode, searchParams, socketConnected, screen, albums, enterRoom]);
+
+  // On the first real user gesture (tap/click/key), unlock the audio context
+  // and consume any pending playback recovery that was deferred from auto-join
+  // or socket reconnect. This is the canonical workaround for browser autoplay
+  // policies (Safari/Chrome refuse to start AudioContext before a gesture).
+  useEffect(() => {
+    if (!awaitingTap) return undefined;
+    let cancelled = false;
+    const fire = async () => {
+      if (cancelled) return;
+      const playState = pendingRecoveryRef.current;
+      pendingRecoveryRef.current = null;
+      setAwaitingTap(false);
+      try {
+        await getAudioCtx(); // resume happens here (we're in a gesture handler)
+      } catch (e) {
+        warn('[RealDac] Could not resume AudioContext on gesture:', e?.message);
+      }
+      if (!playState) return;
+      try {
+        const recovered = await recoverRoomPlayback(playState, { status: 'Catching up…' });
+        if (!recovered) {
+          setRoomStatus('Ready');
+          setSyncPhase('idle');
+        }
+      } catch (e) {
+        console.error('[RealDac] Deferred recovery failed:', e);
+        setRoomStatus('Sync failed');
+        setSyncPhase('idle');
+      }
+    };
+    const events = ['pointerdown', 'keydown', 'touchstart'];
+    events.forEach((ev) => window.addEventListener(ev, fire, { once: true, capture: true }));
+    return () => {
+      cancelled = true;
+      events.forEach((ev) => window.removeEventListener(ev, fire, { capture: true }));
+    };
+  }, [awaitingTap, getAudioCtx, recoverRoomPlayback]);
 
   const preparePlay = useCallback(async (trackId = selectedTrack, options = {}) => {
     if (!roomCode) {
@@ -1501,6 +1550,8 @@ export default function RealDac() {
     setRoomCode('');
     setParticipants(1);
     autoJoinAttempted.current = false;
+    pendingRecoveryRef.current = null;
+    setAwaitingTap(false);
 
     setScreen('join');
     setRoomStatus('');
@@ -1994,6 +2045,24 @@ export default function RealDac() {
         <section className="rd-room">
           {/* ─── Now-playing card ─── */}
           <article className="rd-card rd-now">
+            {awaitingTap && (
+              <button
+                type="button"
+                className="rd-tap-overlay"
+                onClick={() => { /* listener in effect handles it */ }}
+                aria-label="Tap to start listening"
+              >
+                <span className="rd-tap-overlay-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor">
+                    <path d="M8 5v14l11-7z" />
+                  </svg>
+                </span>
+                <span className="rd-tap-overlay-text">
+                  <strong>Tap to start</strong>
+                  <small>Catch up to live playback</small>
+                </span>
+              </button>
+            )}
             <div className={`rd-disc ${isPlaying ? 'is-playing' : ''}`} aria-hidden="true">
               <div className="rd-disc-rings" />
             </div>
