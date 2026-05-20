@@ -1,0 +1,21 @@
+# Yo Yo Honey Singh – YouTube video IDs (via ytmusicapi)
+# Format: song_name | VIDEO_ID | https://youtube.com/watch?v=VIDEO_ID
+
+Brown Rang | O3-6zB3kg8M | https://www.youtube.com/watch?v=O3-6zB3kg8M
+Love Dose | gYmVMU2_J0o | https://www.youtube.com/watch?v=gYmVMU2_J0o
+Blue Eyes | R7JjuceJzFY | https://www.youtube.com/watch?v=R7JjuceJzFY
+Main Sharabi | GS1yeXd2AHY | https://www.youtube.com/watch?v=GS1yeXd2AHY
+Lungi Dance | qny5OwwoYVE | https://www.youtube.com/watch?v=qny5OwwoYVE
+First Kiss | nYPRkswuNng | https://www.youtube.com/watch?v=nYPRkswuNng
+Dheere Dheere | nnjSgp0-z-Q | https://www.youtube.com/watch?v=nnjSgp0-z-Q
+High Heels | 07UjanoLq_g | https://www.youtube.com/watch?v=07UjanoLq_g
+Sunny Sunny | KKLX4C-P_XM | https://www.youtube.com/watch?v=KKLX4C-P_XM
+Desi Kalakaar | 4MOV2I1QVoU | https://www.youtube.com/watch?v=4MOV2I1QVoU
+Char Bottle Vodka | sUbf9PhT7VQ | https://www.youtube.com/watch?v=sUbf9PhT7VQ
+Millionaire | yleXPEPJIgI | https://www.youtube.com/watch?v=yleXPEPJIgI
+Malamaal | Zh8urcnc89M | https://www.youtube.com/watch?v=Zh8urcnc89M
+Rounds N Ring | mROx7TukUQU | https://www.youtube.com/watch?v=mROx7TukUQU
+Party All Night | 10g-oRFXWUc | https://www.youtube.com/watch?v=10g-oRFXWUc
+Dope Shope | -vmqeMuL5M8 | https://www.youtube.com/watch?v=-vmqeMuL5M8
+
+# Run: bash scripts/download-honey-singh.sh
