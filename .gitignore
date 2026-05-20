@@ -25,6 +25,16 @@ Thumbs.db
 .idea/
 *.swp
 
+# Convex AI agent skill (dev tooling, not runtime)
+.agents/
+AGENTS.md
+CLAUDE.md
+skills-lock.json
+convex/_generated/ai/
+convex/_generated/*.d.ts
+convex/_generated/server.js
+convex/tsconfig.json
+
 # Misc
 *.tmp
 .cache/

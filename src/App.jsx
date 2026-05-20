@@ -1,15 +1,18 @@
 import React from 'react';
 import { Routes, Route } from 'react-router-dom';
 import RealDac from './components/RealDac';
-import StitchLanding from './components/StitchLanding';
+import Workspace from './components/Workspace';
+import ErrorBoundary from './components/ErrorBoundary';
 
 export default function App() {
   return (
-    <Routes>
-      <Route path="/" element={<StitchLanding />} />
-      <Route path="/app" element={<RealDac />} />
-      <Route path="/app/:roomCode" element={<RealDac />} />
-      <Route path="/:roomCode" element={<RealDac />} />
-    </Routes>
+    <ErrorBoundary>
+      <Routes>
+        <Route path="/" element={<Workspace />} />
+        <Route path="/app" element={<RealDac />} />
+        <Route path="/app/:roomCode" element={<RealDac />} />
+        <Route path="/:roomCode" element={<RealDac />} />
+      </Routes>
+    </ErrorBoundary>
   );
 }

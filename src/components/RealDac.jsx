@@ -240,6 +240,28 @@ export default function RealDac() {
     const room = searchParams.get('room') || urlRoomCode;
     if (room) setInputCode(String(room).replace(/\D/g, '').slice(0, 6));
   }, [searchParams, urlRoomCode]);
+
+  const autoJoinAttempted = useRef(false);
+  const [trackPickerOpen, setTrackPickerOpen] = useState(false);
+  const trackPickerRef = useRef(null);
+
+  // Click-outside + Escape to close the track picker
+  useEffect(() => {
+    if (!trackPickerOpen) return undefined;
+    const onClick = (e) => {
+      if (!trackPickerRef.current) return;
+      if (!trackPickerRef.current.contains(e.target)) setTrackPickerOpen(false);
+    };
+    const onKey = (e) => {
+      if (e.key === 'Escape') setTrackPickerOpen(false);
+    };
+    document.addEventListener('mousedown', onClick);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onClick);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [trackPickerOpen]);
   const [albums, setAlbums] = useState([FALLBACK_ALBUM]);
   const [selectedAlbum, setSelectedAlbum] = useState(FALLBACK_ALBUM.id);
   const [tracks, setTracks] = useState(FALLBACK_ALBUM.songs);
@@ -359,10 +381,22 @@ export default function RealDac() {
     }
   }, [selectedAlbum, albums, selectedTrack]);
 
-  const roomState = useQuery(
-    roomCode ? api.realdacRooms.getByRoomCode : 'skip',
-    roomCode ? { roomCode } : 'skip'
-  );
+  // Convex query is supplementary — it persists last-selected-track for cross-device recovery.
+  // The real-time sync goes through Socket.IO, so a broken Convex deployment must NOT crash the UI.
+  let roomState;
+  try {
+    roomState = useQuery(
+      roomCode ? api.realdacRooms.getByRoomCode : 'skip',
+      roomCode ? { roomCode } : 'skip'
+    );
+  } catch (e) {
+    if (typeof window !== 'undefined' && !window.__rdConvexWarned) {
+      window.__rdConvexWarned = true;
+      // eslint-disable-next-line no-console
+      console.warn('[RealDac] Convex query failed — running socket-only:', e?.message || e);
+    }
+    roomState = undefined;
+  }
   const updateRoomTrack = useMutation(api.realdacRooms.updateTrack);
 
   useEffect(() => {
@@ -1242,6 +1276,47 @@ export default function RealDac() {
     });
   };
 
+  // Auto-join when arriving via URL (e.g. from Workspace "Start room" → /:code)
+  useEffect(() => {
+    if (autoJoinAttempted.current) return;
+    if (screen === 'room') return;
+    const code = (urlRoomCode || searchParams.get('room') || '').replace(/\D/g, '').slice(0, 6);
+    if (code.length !== 6) return;
+    if (!socketConnected || !socketRef.current?.connected) return;
+    autoJoinAttempted.current = true;
+    setInputCode(code);
+    setJoinStatus('Joining…');
+    socketRef.current.emit('ROOM_JOIN', code, async (res) => {
+      if (res?.error || !res?.success) {
+        autoJoinAttempted.current = false;
+        setJoinStatus(res?.error || 'Room not found');
+        return;
+      }
+      setJoinStatus('');
+      const participantCount = res.participants || 1;
+      if (res.playState?.track) {
+        const { track } = res.playState;
+        const albumWithTrack = albums.find((a) => a.songs?.some((s) => s.id === track));
+        const albumId = albumWithTrack?.id ?? FALLBACK_ALBUM.id;
+        await enterRoom(res.roomCode, participantCount, { track, album: albumId });
+        try {
+          const recovered = await recoverRoomPlayback(res.playState, { status: 'Catching up…' });
+          if (!recovered) {
+            setRoomStatus('Ready');
+            setSyncPhase('idle');
+          }
+        } catch (e) {
+          console.error('[RealDac] Failed to auto-sync room playback:', e);
+          setRoomStatus('Sync failed');
+        }
+      } else {
+        await enterRoom(res.roomCode, participantCount);
+        authoritativePlaybackRef.current = null;
+        setSyncPhase('idle');
+      }
+    });
+  }, [urlRoomCode, searchParams, socketConnected, screen, albums, enterRoom]);
+
   const preparePlay = useCallback(async (trackId = selectedTrack, options = {}) => {
     if (!roomCode) {
       setRoomStatus('Not in a room');
@@ -1425,7 +1500,8 @@ export default function RealDac() {
     roomCodeRef.current = '';
     setRoomCode('');
     setParticipants(1);
-    
+    autoJoinAttempted.current = false;
+
     setScreen('join');
     setRoomStatus('');
     setJoinStatus('');
@@ -1510,13 +1586,13 @@ export default function RealDac() {
   const displayTrackName = toProperCase(trackName) || 'Unknown';
   const displayAlbumName = toProperCase(currentAlbumMeta.name) || 'General';
   const syncBadge = (() => {
-    if (reconnecting) return { label: 'RE-LINKING', tone: '#f59e0b', detail: 'Recovering room state' };
-    if (countdown !== null) return { label: `START ${countdown}`, tone: '#00f2ff', detail: 'Commit received' };
-    if (loadingAudio || syncPhase === 'preparing') return { label: 'BUFFERING', tone: '#00f2ff', detail: 'Loading current track' };
-    if (syncPhase === 'resyncing') return { label: 'SYNCING', tone: '#10b981', detail: 'Tightening drift' };
-    if (syncPhase === 'paused') return { label: 'PAUSED', tone: '#94a3b8', detail: 'Room playback stopped' };
-    if (isPlaying) return { label: 'SYNC LOCK', tone: '#10b981', detail: 'Room playback stable' };
-    return { label: 'STANDBY', tone: '#64748b', detail: 'Awaiting command' };
+    if (reconnecting) return { label: 'RE-LINKING', tone: '#f59e0b', toneKey: 'reconnecting', detail: 'Recovering room state' };
+    if (countdown !== null) return { label: `START ${countdown}`, tone: '#00f2ff', toneKey: 'buffering', detail: 'Commit received' };
+    if (loadingAudio || syncPhase === 'preparing') return { label: 'BUFFERING', tone: '#00f2ff', toneKey: 'buffering', detail: 'Loading current track' };
+    if (syncPhase === 'resyncing') return { label: 'SYNCING', tone: '#10b981', toneKey: 'live', detail: 'Tightening drift' };
+    if (syncPhase === 'paused') return { label: 'PAUSED', tone: '#94a3b8', toneKey: 'paused', detail: 'Room playback stopped' };
+    if (isPlaying) return { label: 'SYNC LOCK', tone: '#10b981', toneKey: 'live', detail: 'Room playback stable' };
+    return { label: 'STANDBY', tone: '#64748b', toneKey: 'standby', detail: 'Awaiting command' };
   })();
   const readinessLabel = `${participants} ${participants === 1 ? 'listener online' : 'listeners online'}`;
   const artFrameLabel = `${roomCode || '000000'} // ${displayAlbumName}`.toUpperCase();
@@ -1764,1052 +1840,405 @@ export default function RealDac() {
     };
   }, [countdown, isPlaying, refreshSyncProfile, schedulePlay]);
 
+  /* Build derived view-state pieces (kept compatible with existing handlers/state) */
+  const showPause = Boolean(shouldShowPauseButton);
+  const elapsedLabel = formatTime(currentProgressMs);
+  const remainingLabel = formatTime(remainingMs);
+  const safeParticipants = Math.max(0, Number(participants) || 0);
+  const avatarMaxVisible = 4;
+  const overflowCount = Math.max(0, safeParticipants - avatarMaxVisible);
+  const avatarSeeds = Array.from({ length: Math.min(safeParticipants, avatarMaxVisible) }, (_, i) => i);
+
   return (
-    <div className="realdac-page" style={{
-      width: '100%',
-      maxWidth: screen === 'room' ? '1360px' : '1200px',
-      margin: '0 auto',
-      padding: screen === 'room' ? 'clamp(10px, 3vw, 24px)' : 'clamp(16px, 4vw, 32px)',
-      minHeight: screen === 'room' ? '100dvh' : '100vh',
-      display: 'flex',
-      flexDirection: 'column',
-      justifyContent: screen === 'room' ? 'center' : 'flex-start',
-      boxSizing: 'border-box',
-      background: 'transparent',
-    }}>
-      <style>{`
-        @keyframes realdacCountdown {
-          0% { transform: scale(0.3); opacity: 0; }
-          15% { transform: scale(1.15); opacity: 1; }
-          30% { transform: scale(1); opacity: 1; }
-          100% { transform: scale(1); opacity: 1; }
-        }
-        .realdac-countdown-digit { animation: realdacCountdown 0.5s ease-out; }
-        @keyframes livePulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
-        .realdac-page .realdac-card {
-          background: linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.02));
-          border: 1px solid rgba(255,255,255,0.08);
-          border-radius: 4px;
-          box-shadow: 0 18px 48px rgba(0,0,0,0.22);
-          transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;
-        }
-        .realdac-page .realdac-card:hover { border-color: rgba(255,255,255,0.16); transform: translateY(-1px); }
-        .realdac-page input:focus, .realdac-page select:focus { outline: none; border-color: var(--text-tertiary); box-shadow: 0 0 0 2px rgba(255,255,255,0.08); }
-        .realdac-page .realdac-room-shell {
-          position: relative;
-          border-radius: 4px;
-          padding: clamp(14px, 2.4vw, 22px);
-          background:
-            radial-gradient(circle at top center, rgba(0, 242, 255, 0.10), transparent 32%),
-            linear-gradient(180deg, rgba(17, 20, 23, 0.98), rgba(8, 10, 12, 0.98));
-          border: 1px solid rgba(0, 242, 255, 0.12);
-          overflow: hidden;
-          box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 26px 80px rgba(0,0,0,0.45);
-          max-height: calc(100dvh - 24px);
-        }
-        .realdac-page .realdac-room-shell::before {
-          content: '';
-          position: absolute;
-          inset: 0;
-          pointer-events: none;
-          background-image:
-            linear-gradient(rgba(0, 242, 255, 0.04) 1px, transparent 1px),
-            linear-gradient(90deg, rgba(0, 242, 255, 0.04) 1px, transparent 1px);
-          background-size: 44px 44px;
-          mask-image: linear-gradient(180deg, rgba(0,0,0,0.45), transparent 70%);
-        }
-        .realdac-page .realdac-room-stage {
-          display: grid;
-          grid-template-columns: minmax(0, 1.32fr) minmax(260px, 0.68fr);
-          gap: 18px;
-          align-items: start;
-          position: relative;
-          z-index: 1;
-        }
-        .realdac-page .realdac-tech-panel {
-          position: relative;
-          padding: clamp(14px, 2.2vw, 22px);
-          border-radius: 4px;
-          background:
-            linear-gradient(180deg, rgba(28, 31, 35, 0.96), rgba(11, 12, 14, 0.96));
-          border: 1px solid rgba(0, 242, 255, 0.12);
-          box-shadow: inset 0 1px 0 rgba(255,255,255,0.03), 0 16px 48px rgba(0,0,0,0.32);
-          overflow: hidden;
-        }
-        .realdac-page .realdac-tech-panel::after {
-          content: '';
-          position: absolute;
-          inset: 10px;
-          border: 1px solid rgba(0, 242, 255, 0.06);
-          border-radius: 4px;
-          pointer-events: none;
-        }
-        .realdac-page .realdac-tech-chip {
-          display: inline-flex;
-          align-items: center;
-          gap: 8px;
-          padding: 6px 10px;
-          border-radius: 4px;
-          border: 1px solid rgba(0, 242, 255, 0.14);
-          background: rgba(10, 16, 19, 0.88);
-          color: #dffcff;
-          font-size: 11px;
-          font-weight: 700;
-          letter-spacing: 0.12em;
-          text-transform: uppercase;
-        }
-        .realdac-page .realdac-tech-chip-muted {
-          color: rgba(229, 226, 227, 0.68);
-          border-color: rgba(58, 73, 75, 0.42);
-          background: rgba(15, 16, 18, 0.78);
-        }
-        .realdac-page .realdac-console-header {
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          gap: 12px;
-          margin-bottom: 14px;
-        }
-        .realdac-page .realdac-console-brand {
-          display: flex;
-          align-items: center;
-          gap: 12px;
-          min-width: 0;
-        }
-        .realdac-page .realdac-console-kicker {
-          font-size: 9px;
-          letter-spacing: 0.18em;
-          text-transform: uppercase;
-          color: rgba(0, 242, 255, 0.9);
-          font-weight: 700;
-          margin-bottom: 2px;
-        }
-        .realdac-page .realdac-console-title {
-          font-family: 'AmericanCaptain', 'Bebas Neue', sans-serif;
-          font-size: clamp(24px, 3.2vw, 34px);
-          letter-spacing: 0.10em;
-          color: var(--text-primary);
-          line-height: 0.95;
-        }
-        .realdac-page .realdac-console-meta {
-          display: flex;
-          align-items: center;
-          justify-content: flex-end;
-          flex-wrap: wrap;
-          gap: 8px;
-        }
-        .realdac-page .realdac-panel-button {
-          width: 42px;
-          height: 42px;
-          display: inline-flex;
-          align-items: center;
-          justify-content: center;
-          border-radius: 4px;
-          border: 1px solid rgba(58, 73, 75, 0.62);
-          background: rgba(10, 13, 15, 0.92);
-          color: rgba(229, 226, 227, 0.86);
-          cursor: pointer;
-          transition: transform 0.18s ease, border-color 0.18s ease, color 0.18s ease, background 0.18s ease;
-        }
-        .realdac-page .realdac-panel-button:hover:not(:disabled) {
-          transform: translateY(-1px);
-          border-color: rgba(0, 242, 255, 0.32);
-          color: #dffcff;
-        }
-        .realdac-page .realdac-panel-button:disabled {
-          opacity: 0.35;
-          cursor: not-allowed;
-        }
-        .realdac-page .realdac-tech-art {
-          position: relative;
-          width: min(100%, clamp(240px, 30vh, 340px));
-          aspect-ratio: 1 / 1;
-          margin: 0 auto 14px;
-          border-radius: 4px;
-          overflow: hidden;
-          background:
-            radial-gradient(circle at 50% 46%, rgba(0, 242, 255, 0.20), transparent 16%),
-            radial-gradient(circle at 50% 50%, rgba(255, 59, 48, 0.10), transparent 30%),
-            linear-gradient(180deg, rgba(7, 10, 12, 0.94), rgba(13, 16, 19, 0.98));
-          border: 1px solid rgba(0, 242, 255, 0.18);
-          box-shadow: inset 0 0 0 1px rgba(255,255,255,0.03), 0 32px 72px rgba(0,0,0,0.42);
-        }
-        .realdac-page .realdac-tech-art::before,
-        .realdac-page .realdac-tech-art::after {
-          content: '';
-          position: absolute;
-          inset: 14px;
-          border-radius: 4px;
-          border: 1px solid rgba(0, 242, 255, 0.08);
-        }
-        .realdac-page .realdac-tech-art::after {
-          inset: auto 14px 14px 14px;
-          height: 24%;
-          background: linear-gradient(180deg, transparent, rgba(6, 8, 10, 0.92));
-          border: none;
-          border-radius: 0 0 4px 4px;
-        }
-        .realdac-page .realdac-tech-art-grid {
-          position: absolute;
-          inset: 0;
-          background-image:
-            linear-gradient(rgba(0, 242, 255, 0.06) 1px, transparent 1px),
-            linear-gradient(90deg, rgba(0, 242, 255, 0.05) 1px, transparent 1px);
-          background-size: 34px 34px;
-          mask-image: radial-gradient(circle at center, rgba(0,0,0,0.55), transparent 72%);
-          opacity: 0.72;
-        }
-        .realdac-page .realdac-tech-art-core {
-          position: absolute;
-          left: 50%;
-          top: 50%;
-          width: 54%;
-          height: 54%;
-          transform: translate(-50%, -54%);
-          border-radius: 50%;
-          border: 1px solid rgba(0, 242, 255, 0.18);
-          box-shadow: 0 0 0 14px rgba(0, 242, 255, 0.04), 0 0 40px rgba(0, 242, 255, 0.18);
-        }
-        .realdac-page .realdac-tech-art-core::before,
-        .realdac-page .realdac-tech-art-core::after {
-          content: '';
-          position: absolute;
-          inset: 14%;
-          border-radius: 50%;
-          border: 1px solid rgba(0, 242, 255, 0.24);
-        }
-        .realdac-page .realdac-tech-art-core::after {
-          inset: 28%;
-          border-color: rgba(255, 59, 48, 0.18);
-          box-shadow: 0 0 24px rgba(255, 59, 48, 0.14);
-        }
-        .realdac-page .realdac-tech-art-logo {
-          position: absolute;
-          inset: 20%;
-          width: 60%;
-          height: 60%;
-          object-fit: contain;
-          opacity: 0.2;
-          filter: hue-rotate(170deg) saturate(1.2) brightness(1.05);
-        }
-        .realdac-page .realdac-tech-art-label,
-        .realdac-page .realdac-tech-art-footer {
-          position: absolute;
-          left: 18px;
-          right: 18px;
-          z-index: 2;
-        }
-        .realdac-page .realdac-tech-art-label {
-          top: 18px;
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          gap: 10px;
-        }
-        .realdac-page .realdac-tech-art-footer {
-          bottom: 18px;
-          display: flex;
-          align-items: center;
-          justify-content: flex-start;
-          gap: 10px;
-        }
-        .realdac-page .realdac-tech-code {
-          font-size: 9px;
-          font-weight: 700;
-          letter-spacing: 0.18em;
-          text-transform: uppercase;
-          color: rgba(223, 252, 255, 0.78);
-        }
-        .realdac-page .realdac-tech-tag {
-          display: inline-flex;
-          align-items: center;
-          gap: 6px;
-          padding: 5px 9px;
-          border-radius: 4px;
-          background: rgba(6, 9, 10, 0.88);
-          border: 1px solid rgba(0, 242, 255, 0.15);
-          font-size: 9px;
-          font-weight: 700;
-          letter-spacing: 0.12em;
-          text-transform: uppercase;
-          color: #dffcff;
-        }
-        .realdac-page .realdac-hud-title {
-          font-family: 'Space Grotesk', system-ui, sans-serif;
-          font-size: clamp(24px, 2.4vw, 30px);
-          font-weight: 800;
-          line-height: 1.02;
-          color: var(--text-primary);
-          margin: 0 0 4px;
-        }
-        .realdac-page .realdac-hud-subtitle {
-          font-family: 'Space Grotesk', system-ui, sans-serif;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          flex-wrap: wrap;
-          gap: 6px;
-          font-size: 13px;
-          color: rgba(223, 252, 255, 0.82);
-          margin-bottom: 12px;
-        }
-        .realdac-page .realdac-progress-shell {
-          margin-bottom: 16px;
-          padding: 12px 14px;
-          border-radius: 4px;
-          background: rgba(8, 11, 12, 0.84);
-          border: 1px solid rgba(58, 73, 75, 0.32);
-        }
-        .realdac-page .realdac-progress-meta {
-          display: flex;
-          justify-content: space-between;
-          align-items: flex-end;
-          gap: 12px;
-          margin-bottom: 8px;
-        }
-        .realdac-page .realdac-time-cluster {
-          display: flex;
-          flex-direction: column;
-          gap: 2px;
-        }
-        .realdac-page .realdac-time-value {
-          font-family: 'Space Grotesk', system-ui, sans-serif;
-          font-size: 11px;
-          font-weight: 700;
-          font-variant-numeric: tabular-nums;
-          color: rgba(229, 226, 227, 0.84);
-        }
-        .realdac-page .realdac-time-label {
-          font-size: 8px;
-          text-transform: uppercase;
-          letter-spacing: 0.16em;
-          color: rgba(137, 160, 166, 0.72);
-        }
-        .realdac-page .realdac-range {
-          height: 6px;
-          background: linear-gradient(90deg, #00c8d6 0%, #00c8d6 var(--range-progress, 0%), rgba(58,73,75,0.55) var(--range-progress, 0%), rgba(58,73,75,0.55) 100%);
-        }
-        .realdac-page .realdac-range::-webkit-slider-thumb {
-          width: 16px;
-          height: 16px;
-          background: #dffcff;
-          box-shadow: 0 0 0 4px rgba(0, 242, 255, 0.18), 0 0 18px rgba(0, 242, 255, 0.22);
-        }
-        .realdac-page .realdac-range::-moz-range-thumb {
-          width: 16px;
-          height: 16px;
-          background: #dffcff;
-          box-shadow: 0 0 0 4px rgba(0, 242, 255, 0.18), 0 0 18px rgba(0, 242, 255, 0.22);
-        }
-        .realdac-page .realdac-tech-readout {
-          display: flex;
-          justify-content: space-between;
-          align-items: center;
-          gap: 10px;
-          margin-top: 8px;
-          font-size: 9px;
-          text-transform: uppercase;
-          letter-spacing: 0.14em;
-          color: rgba(137, 160, 166, 0.85);
-        }
-        .realdac-page .realdac-tech-controls {
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          gap: 10px;
-          margin-bottom: 14px;
-          flex-wrap: wrap;
-        }
-        .realdac-page .realdac-reactor-button {
-          width: 68px;
-          height: 52px;
-          border-radius: 4px;
-          border: 1px solid rgba(0, 242, 255, 0.24);
-          background: linear-gradient(180deg, rgba(13, 17, 19, 0.98), rgba(7, 10, 12, 0.98));
-          display: inline-flex;
-          align-items: center;
-          justify-content: center;
-          color: #e6fdff;
-          cursor: pointer;
-          transition: transform 0.18s ease, border-color 0.18s ease, background 0.18s ease, color 0.18s ease;
-        }
-        .realdac-page .realdac-reactor-button:hover:not(:disabled) {
-          transform: translateY(-1px);
-          border-color: rgba(0, 242, 255, 0.36);
-          background: linear-gradient(180deg, rgba(16, 21, 24, 0.98), rgba(8, 11, 13, 0.98));
-          color: #ffffff;
-        }
-        .realdac-page .realdac-reactor-button:disabled {
-          opacity: 0.42;
-          cursor: not-allowed;
-        }
-        .realdac-page .realdac-diagnostics {
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          gap: 10px;
-          padding: 10px 12px;
-          margin-bottom: 14px;
-          border-radius: 4px;
-          background: rgba(6, 9, 10, 0.86);
-          border: 1px solid rgba(58, 73, 75, 0.32);
-          flex-wrap: wrap;
-        }
-        .realdac-page .realdac-diagnostics-users {
-          display: flex;
-          align-items: center;
-          gap: 8px;
-        }
-        .realdac-page .realdac-user-pip {
-          width: 22px;
-          height: 22px;
-          border-radius: 4px;
-          display: inline-flex;
-          align-items: center;
-          justify-content: center;
-          font-size: 9px;
-          font-weight: 800;
-          color: #dffcff;
-          background: rgba(0, 242, 255, 0.12);
-          border: 1px solid rgba(0, 242, 255, 0.2);
-        }
-        .realdac-page .realdac-action-grid {
-          display: grid;
-          grid-template-columns: repeat(3, minmax(0, 1fr));
-          gap: 10px;
-        }
-        .realdac-page .realdac-command-button {
-          min-height: 70px;
-          border-radius: 4px;
-          border: 1px solid rgba(58, 73, 75, 0.34);
-          background: linear-gradient(180deg, rgba(14, 17, 19, 0.96), rgba(9, 10, 12, 0.98));
-          color: var(--text-primary);
-          display: flex;
-          flex-direction: column;
-          align-items: center;
-          justify-content: center;
-          gap: 5px;
-          font-size: 9px;
-          font-weight: 700;
-          letter-spacing: 0.10em;
-          text-transform: uppercase;
-          cursor: pointer;
-          transition: transform 0.18s ease, border-color 0.18s ease, color 0.18s ease;
-        }
-        .realdac-page .realdac-command-button:hover {
-          transform: translateY(-1px);
-          border-color: rgba(0, 242, 255, 0.22);
-          color: #dffcff;
-        }
-        .realdac-page .realdac-command-button-danger {
-          color: #ff8d84;
-          border-color: rgba(255, 59, 48, 0.28);
-        }
-        .realdac-page .realdac-sidebar-stack {
-          display: flex;
-          flex-direction: column;
-          gap: 12px;
-        }
-        .realdac-page .realdac-mobile-room-access {
-          display: none;
-        }
-        .realdac-page .realdac-sidebar-title {
-          font-size: 9px;
-          text-transform: uppercase;
-          letter-spacing: 0.16em;
-          color: rgba(0, 242, 255, 0.86);
-          font-weight: 700;
-          margin-bottom: 8px;
-        }
-        .realdac-page .realdac-muted-readout {
-          display: inline-flex;
-          align-items: center;
-          gap: 8px;
-          padding: 6px 10px;
-          border-radius: 4px;
-          background: rgba(8, 11, 12, 0.78);
-          border: 1px solid rgba(58, 73, 75, 0.30);
-          color: rgba(223, 252, 255, 0.74);
-          font-size: 10px;
-          font-weight: 700;
-          letter-spacing: 0.12em;
-          text-transform: uppercase;
-        }
-        .realdac-page .realdac-sidebar-block {
-          display: flex;
-          flex-direction: column;
-          gap: 10px;
-        }
-        .realdac-page .realdac-input-shell {
-          width: 100%;
-          padding: 10px 12px;
-          font-size: 12px;
-          border-radius: 4px;
-          border: 1px solid rgba(58, 73, 75, 0.42);
-          background: rgba(8, 11, 12, 0.82);
-          color: var(--text-primary);
-          box-sizing: border-box;
-        }
-        .realdac-page .realdac-room-code-display {
-          display: flex;
-          align-items: baseline;
-          justify-content: space-between;
-          gap: 12px;
-          flex-wrap: wrap;
-          padding: 12px 14px;
-          border-radius: 4px;
-          background: rgba(8, 11, 12, 0.86);
-          border: 1px solid rgba(0, 242, 255, 0.14);
-        }
-        .realdac-page .realdac-room-code-value {
-          font-size: clamp(24px, 3.2vw, 34px);
-          font-family: 'Space Grotesk', system-ui, sans-serif;
-          font-weight: 800;
-          letter-spacing: 0.22em;
-          color: #dffcff;
-          text-shadow: 0 0 18px rgba(0, 242, 255, 0.22);
-        }
-        .realdac-page .realdac-qr-shell {
-          padding: 12px;
-          border-radius: 4px;
-          background: rgba(255,255,255,0.98);
-          display: inline-flex;
-          flex-direction: column;
-          align-items: center;
-          gap: 10px;
-          align-self: center;
-          box-shadow: 0 12px 32px rgba(0,0,0,0.24);
-        }
-        .realdac-page .realdac-mini-note {
-          font-size: 10px;
-          color: rgba(229, 226, 227, 0.62);
-          line-height: 1.6;
-        }
-        @media (min-width: 900px) {
-          .realdac-page .realdac-room-shell { display: flex; align-items: center; }
-          .realdac-page .realdac-room-stage { width: 100%; }
-          .realdac-page .realdac-command-button svg,
-          .realdac-page .realdac-panel-button svg { transform: scale(0.92); }
-        }
-        .realdac-page .realdac-range {
-          -webkit-appearance: none;
-          appearance: none;
-          width: 100%;
-          height: 4px;
-          border-radius: 999px;
-          outline: none;
-          background: linear-gradient(90deg, #1db954 0%, #1db954 var(--range-progress, 0%), rgba(255,255,255,0.18) var(--range-progress, 0%), rgba(255,255,255,0.18) 100%);
-        }
-        .realdac-page .realdac-range::-webkit-slider-thumb {
-          -webkit-appearance: none;
-          appearance: none;
-          width: 14px;
-          height: 14px;
-          border-radius: 50%;
-          background: #ffffff;
-          box-shadow: 0 0 0 4px rgba(29,185,84,0.18);
-          cursor: pointer;
-        }
-        .realdac-page .realdac-range::-moz-range-thumb {
-          width: 14px;
-          height: 14px;
-          border: 0;
-          border-radius: 50%;
-          background: #ffffff;
-          box-shadow: 0 0 0 4px rgba(29,185,84,0.18);
-          cursor: pointer;
-        }
-        @media (min-width: 900px) {
-          .realdac-page .realdac-join-grid { display: grid !important; grid-template-columns: 1fr 1fr; gap: 24px; align-items: start; }
-          .realdac-page .realdac-room-layout { display: grid !important; grid-template-columns: minmax(0, 1.2fr) minmax(280px, 0.8fr); gap: 24px; align-items: start; }
-        }
-        @media (max-width: 600px) {
-          .realdac-page {
-            padding: 8px max(10px, env(safe-area-inset-left)) max(18px, calc(12px + env(safe-area-inset-bottom))) max(10px, env(safe-area-inset-right)) !important;
-          }
-          .realdac-page .realdac-room-shell {
-            max-height: none !important;
-            overflow: visible !important;
-          }
-          .realdac-page .realdac-header { margin-bottom: 20px !important; padding-top: 0 !important; }
-          .realdac-page .realdac-header h1 { font-size: 24px !important; letter-spacing: 0.08em !important; }
-          .realdac-page .realdac-header p { font-size: 13px !important; }
-          .realdac-page .realdac-card { border-radius: 4px; padding: 16px !important; }
-          .realdac-page .realdac-join-grid { gap: 16px !important; }
-          .realdac-page .realdac-room-grid { gap: 16px !important; }
-          .realdac-page .realdac-room-main { padding: 16px !important; }
-          .realdac-page .realdac-room-code { font-size: clamp(40px, 14vw, 72px) !important; letter-spacing: 0.2em !important; font-weight: 900 !important; }
-          .realdac-page .realdac-play-btn { min-width: 52px !important; min-height: 52px !important; }
-          .realdac-page .realdac-room-shell { padding: 14px !important; border-radius: 4px !important; }
-          .realdac-page .realdac-room-stage { grid-template-columns: 1fr !important; gap: 16px !important; }
-          .realdac-page .realdac-tech-panel { padding: 14px !important; border-radius: 4px !important; }
-          .realdac-page .realdac-console-header { align-items: center !important; gap: 10px !important; margin-bottom: 14px !important; }
-          .realdac-page .realdac-console-brand { gap: 10px !important; }
-          .realdac-page .realdac-console-kicker { font-size: 9px !important; margin-bottom: 0 !important; }
-          .realdac-page .realdac-console-title { font-size: 24px !important; }
-          .realdac-page .realdac-console-meta { justify-content: flex-end !important; gap: 6px !important; }
-          .realdac-page .realdac-tech-chip { padding: 5px 8px !important; font-size: 9px !important; letter-spacing: 0.1em !important; }
-          .realdac-page .realdac-tech-art { width: min(100%, 278px) !important; border-radius: 4px !important; margin-bottom: 14px !important; }
-          .realdac-page .realdac-tech-art-label,
-          .realdac-page .realdac-tech-art-footer { left: 16px !important; right: 16px !important; }
-          .realdac-page .realdac-tech-code,
-          .realdac-page .realdac-tech-tag { font-size: 8px !important; }
-          .realdac-page .realdac-hud-title { font-size: 24px !important; margin-bottom: 4px !important; }
-          .realdac-page .realdac-hud-subtitle { justify-content: center !important; text-align: center !important; margin-bottom: 12px !important; font-size: 12px !important; gap: 6px !important; }
-          .realdac-page .realdac-progress-shell { padding: 12px !important; margin-bottom: 16px !important; }
-          .realdac-page .realdac-progress-meta { align-items: flex-end !important; margin-bottom: 10px !important; }
-          .realdac-page .realdac-time-value { font-size: 11px !important; }
-          .realdac-page .realdac-time-label { font-size: 8px !important; }
-          .realdac-page .realdac-tech-readout { gap: 6px !important; font-size: 8px !important; letter-spacing: 0.1em !important; }
-          .realdac-page .realdac-tech-controls { gap: 10px !important; }
-          .realdac-page .realdac-panel-button { width: 40px !important; height: 40px !important; }
-          .realdac-page .realdac-reactor-button { width: 64px !important; height: 48px !important; }
-          .realdac-page .realdac-diagnostics { gap: 10px !important; padding: 10px 12px !important; margin-bottom: 14px !important; }
-          .realdac-page .realdac-user-pip { width: 22px !important; height: 22px !important; font-size: 9px !important; }
-          .realdac-page .realdac-action-grid { grid-template-columns: repeat(3, minmax(0, 1fr)) !important; gap: 8px !important; }
-          .realdac-page .realdac-command-button { min-height: 64px !important; gap: 5px !important; font-size: 8px !important; letter-spacing: 0.08em !important; padding: 8px 4px !important; }
-          .realdac-page .realdac-sidebar-stack { display: none !important; }
-          .realdac-page .realdac-mobile-room-access { display: block !important; margin-bottom: 14px !important; }
-          .realdac-page .realdac-room-code-display { padding: 14px !important; }
-          .realdac-page .realdac-room-code-value { font-size: clamp(24px, 9vw, 34px) !important; }
-          .realdac-page .realdac-qr-shell { width: 100%; box-sizing: border-box; }
-          .realdac-page .realdac-sidebar-stack { gap: 14px !important; }
-          .realdac-page input, .realdac-page button { -webkit-tap-highlight-color: transparent; min-height: 44px; }
-          .realdac-page .realdac-qr-img { width: 120px !important; height: 120px !important; }
-        }
-        @media (max-width: 480px) {
-          .realdac-page .realdac-room-code { font-size: clamp(32px, 11vw, 56px) !important; letter-spacing: 0.12em !important; }
-          .realdac-page .realdac-card { padding: 14px !important; }
-          .realdac-page .realdac-room-main { padding: 14px !important; }
-        }
-        @media (max-width: 600px) {
-          .realdac-countdown-digit { font-size: clamp(72px, 32vw, 120px) !important; }
-        }
-      `}</style>
-
-      {/* ========== COUNTDOWN OVERLAY (sync 3-2-1-0) ========== */}
+    <div className="realdac-page">
+      {/* Countdown overlay (sync 3-2-1-0) */}
       {countdown !== null && (
-        <div style={{
-          position: 'fixed',
-          inset: 0,
-          zIndex: 9999,
-          display: 'flex',
-          flexDirection: 'column',
-          alignItems: 'center',
-          justifyContent: 'center',
-          background: 'rgba(0,0,0,0.85)',
-          pointerEvents: 'none',
-        }}>
-          <div className="realdac-countdown-digit" style={{
-            fontSize: 'clamp(80px, 35vw, 200px)',
-            fontWeight: 800,
-            fontFamily: 'monospace',
-            color: 'var(--text-primary)',
-            lineHeight: 1,
-            textShadow: '0 0 60px rgba(255,255,255,0.3)',
-          }}>
-            {countdown}
-          </div>
-          <div style={{ fontSize: '14px', color: 'var(--text-secondary)', marginTop: '12px' }}>
-            {countdown === 0 ? 'Go!' : 'seconds'}
-          </div>
+        <div className="rd-countdown" role="status" aria-live="assertive">
+          <div className="rd-countdown-digit">{countdown}</div>
+          <div className="rd-countdown-sub">{countdown === 0 ? 'Go' : 'Syncing'}</div>
         </div>
       )}
 
-      {/* ========== HEADER ========== */}
-      {screen !== 'room' && (
-        <div className="realdac-header" style={{ textAlign: 'center', marginBottom: '32px', paddingTop: '8px' }}>
-          <div style={{ fontSize: '10px', fontWeight: 700, letterSpacing: '0.2em', textTransform: 'uppercase', color: 'var(--text-tertiary)', marginBottom: '6px' }}>
-            Sync
+      {/* ───────── Top bar ───────── */}
+      <header className="rd-topbar">
+        <div className="rd-topbar-left">
+          <div className="rd-brand">
+            <span className="rd-brand-mark" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none">
+                <circle cx="12" cy="12" r="3" fill="currentColor" />
+                <circle cx="12" cy="12" r="7" stroke="currentColor" strokeWidth="1.5" opacity="0.45" />
+                <circle cx="12" cy="12" r="10.5" stroke="currentColor" strokeWidth="1" opacity="0.2" />
+              </svg>
+            </span>
+            <span className="rd-brand-name">RealDac</span>
+            {screen !== 'room' && <span className="rd-brand-tag">console</span>}
           </div>
-          <h1 style={{
-            fontSize: 'clamp(28px, 5vw, 44px)',
-            fontWeight: 400,
-            letterSpacing: '0.14em',
-            margin: '0 0 10px 0',
-            fontFamily: "'AmericanCaptain', 'Bebas Neue', sans-serif",
-            color: 'var(--text-primary)',
-            textTransform: 'uppercase',
-          }}>
-            RealDac
-          </h1>
-          <p style={{
-            fontSize: '14px',
-            color: 'var(--text-secondary)',
-            margin: '0 auto',
-            lineHeight: 1.6,
-            maxWidth: '520px',
-          }}>
-            Everyone in the same room hears the same music at the exact same moment.
-          </p>
-          <div style={{
-            display: 'inline-flex',
-            alignItems: 'center',
-            gap: '8px',
-            marginTop: '12px',
-            padding: '6px 14px',
-            borderRadius: '4px',
-            background: 'var(--card-bg)',
-            border: '1px solid var(--border-color)',
-            fontSize: '12px',
-            fontWeight: 600,
-            color: socketConnected ? 'var(--success-color)' : '#f59e0b',
-            letterSpacing: '0.05em',
-          }}>
-            <span style={{
-              width: '6px', height: '6px', borderRadius: '50%',
-              background: socketConnected ? 'var(--success-color)' : '#f59e0b',
-              animation: socketConnected ? 'livePulse 2s infinite' : 'none',
-            }} />
-            {socketConnected ? 'Live' : 'Connecting…'}
-          </div>
-        </div>
-      )}
 
-      {/* ========== JOIN SCREEN ========== */}
-      {screen === 'join' && (
-        <div className="realdac-join-grid" style={{ display: 'flex', flexDirection: 'column', gap: '24px' }}>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-            <div className="realdac-card" style={{ padding: '24px' }}>
-              <label style={{ fontSize: '10px', fontWeight: 700, letterSpacing: '0.1em', textTransform: 'uppercase', color: 'var(--text-tertiary)', marginBottom: '8px', display: 'block' }}>
-                Room code
-              </label>
-              <input
-                type="text"
-                placeholder="000000"
-                maxLength={6}
-                inputMode="numeric"
-                value={inputCode}
-                onChange={(e) => setInputCode(e.target.value.replace(/\D/g, ''))}
-                onKeyDown={(e) => e.key === 'Enter' && handleJoin()}
-                style={{
-                  width: '100%', padding: '14px', fontSize: '20px', fontWeight: 700,
-                  letterSpacing: '0.35em', textAlign: 'center', fontFamily: 'monospace',
-                  border: '2px solid var(--border-color)', borderRadius: '4px',
-                  background: 'var(--input-bg)', color: 'var(--text-primary)',
-                  boxSizing: 'border-box', outline: 'none',
-                }}
-              />
-              {joinStatus && <p style={{ fontSize: '12px', color: 'var(--error-color)', margin: '8px 0 0 0' }}>{joinStatus}</p>}
+          {screen === 'room' && roomCode && (
+            <>
+              <span className="rd-topbar-divider" aria-hidden="true" />
               <button
-                onClick={handleJoin}
-                disabled={!socketConnected}
-                style={{
-                  width: '100%', marginTop: '14px', padding: '14px',
-                  fontSize: '14px', fontWeight: 600, border: 'none', borderRadius: '4px',
-                  background: 'var(--text-primary)', color: 'var(--bg-primary)',
-                  cursor: socketConnected ? 'pointer' : 'not-allowed',
-                  opacity: socketConnected ? 1 : 0.5,
-                }}
+                type="button"
+                className="rd-codechip"
+                onClick={() => void copyToClipboard(roomCode, 'Room code copied')}
+                title="Click to copy room code"
+                aria-label={`Room code ${roomCode}, click to copy`}
               >
-                Join Room
+                <span className="rd-codechip-label">Room</span>
+                <span className="rd-codechip-code">{String(roomCode).replace(/^(\d{3})(\d{3})$/, '$1 $2')}</span>
+                <span className="rd-codechip-icon" aria-hidden="true">
+                  <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                    <rect x="5" y="5" width="9" height="9" rx="1.6" />
+                    <path d="M3 11H2.5A.5.5 0 0 1 2 10.5V2.5A.5.5 0 0 1 2.5 2h8a.5.5 0 0 1 .5.5V3" />
+                  </svg>
+                </span>
+              </button>
+            </>
+          )}
+        </div>
+
+        <div className="rd-topbar-right">
+          <span
+            className={`rd-syncpill rd-syncpill--${syncBadge.toneKey || 'standby'}`}
+            title={syncBadge.detail}
+            role="status"
+            aria-live="polite"
+          >
+            <span className="rd-syncpill-dot" />
+            <span className="rd-syncpill-label">{syncBadge.label}</span>
+          </span>
+
+          {screen === 'room' && (
+            <>
+              <button
+                type="button"
+                className="rd-btn rd-btn--primary"
+                onClick={() => void handleShareInvite()}
+                title="Share invite"
+              >
+                <TechIcon size={14} strokeWidth={2}>
+                  <path d="M4 12v7a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-7" />
+                  <path d="M16 6l-4-4-4 4" />
+                  <path d="M12 2v13" />
+                </TechIcon>
+                Invite
+              </button>
+              <button
+                type="button"
+                className="rd-btn rd-btn--danger"
+                onClick={handleLeave}
+                title="Leave room"
+              >
+                <TechIcon size={14} strokeWidth={2}>
+                  <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+                  <path d="M16 17l5-5-5-5" />
+                  <path d="M21 12H9" />
+                </TechIcon>
+                Leave
+              </button>
+            </>
+          )}
+        </div>
+      </header>
+
+      {/* ───────── Connecting state (URL has a code, auto-join in flight) ───────── */}
+      {screen === 'join' && urlRoomCode && (
+        <section className="rd-fallback rd-fallback--connecting" aria-busy="true">
+          <div className="rd-fallback-disc" aria-hidden="true">
+            <div className="rd-disc-rings" />
+          </div>
+          <h2>Joining room {urlRoomCode}</h2>
+          <p>{joinStatus || (socketConnected ? 'Syncing with the room…' : 'Connecting to the server…')}</p>
+          {joinStatus && /not found|error|failed/i.test(joinStatus) && (
+            <a href="/" className="rd-btn rd-btn--lg" style={{ textDecoration: 'none', marginTop: 'var(--space-2)' }}>
+              ← Back to entry
+            </a>
+          )}
+        </section>
+      )}
+
+      {/* ───────── Manual fallback (no URL code — direct hit on /app) ───────── */}
+      {screen === 'join' && !urlRoomCode && (
+        <section className="rd-fallback">
+          <h2>Start or join a room</h2>
+          <p>Head back to the entry to create a fresh room or paste a 6-digit code.</p>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-3)', width: '100%', maxWidth: 280 }}>
+            <input
+              type="text"
+              placeholder="000000"
+              maxLength={6}
+              inputMode="numeric"
+              value={inputCode}
+              onChange={(e) => setInputCode(e.target.value.replace(/\D/g, ''))}
+              onKeyDown={(e) => e.key === 'Enter' && handleJoin()}
+              className="rd-select"
+              style={{ textAlign: 'center', fontFamily: "'JetBrains Mono', monospace", fontSize: 18, letterSpacing: '0.32em' }}
+              aria-label="Room code"
+            />
+            {joinStatus && <p style={{ margin: 0, fontSize: 12, color: 'var(--danger)' }}>{joinStatus}</p>}
+            <button className="rd-btn rd-btn--primary rd-btn--lg" onClick={handleJoin} disabled={!socketConnected}>
+              Join room
+            </button>
+            <button className="rd-btn rd-btn--lg" onClick={handleCreate} disabled={!socketConnected}>
+              Create new room
+            </button>
+            <a href="/" className="rd-btn rd-btn--lg" style={{ textDecoration: 'none' }}>
+              ← Back to entry
+            </a>
+          </div>
+        </section>
+      )}
+
+      {/* ───────── Room (3-panel layout) ───────── */}
+      {screen === 'room' && (
+        <section className="rd-room">
+          {/* ─── Now-playing card ─── */}
+          <article className="rd-card rd-now">
+            <div className={`rd-disc ${isPlaying ? 'is-playing' : ''}`} aria-hidden="true">
+              <div className="rd-disc-rings" />
+            </div>
+
+            <div className="rd-track-meta" ref={trackPickerRef}>
+              <button
+                type="button"
+                className={`rd-track-trigger ${trackPickerOpen ? 'is-open' : ''}`}
+                onClick={() => setTrackPickerOpen((v) => !v)}
+                aria-haspopup="listbox"
+                aria-expanded={trackPickerOpen}
+                title="Change track"
+                disabled={tracks.length <= 1}
+              >
+                <span className="rd-track-title">{displayTrackName || 'Untitled track'}</span>
+                {tracks.length > 1 && (
+                  <span className="rd-track-chevron" aria-hidden="true">
+                    <svg viewBox="0 0 12 12" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M2.5 4.5L6 8l3.5-3.5" />
+                    </svg>
+                  </span>
+                )}
+              </button>
+
+              <div className="rd-track-sub">
+                <span className="rd-track-sub-album">{displayAlbumName || '—'}</span>
+                <span className="rd-track-sub-dot">·</span>
+                <span>{syncBadge.detail || (isPlaying ? 'Playing in sync' : 'Ready')}</span>
+              </div>
+
+              {trackPickerOpen && tracks.length > 1 && (
+                <div className="rd-track-popover" role="listbox" aria-label="Tracks in this album">
+                  <div className="rd-track-popover-head">
+                    <span className="rd-track-popover-label">Tracks</span>
+                    <span className="rd-track-popover-count">{tracks.length}</span>
+                  </div>
+                  <ul className="rd-track-list">
+                    {tracks.map((t, i) => {
+                      const active = t.id === selectedTrack;
+                      return (
+                        <li key={t.id}>
+                          <button
+                            type="button"
+                            role="option"
+                            aria-selected={active}
+                            className={`rd-track-item ${active ? 'is-active' : ''}`}
+                            onClick={() => {
+                              setSelectedTrack(t.id);
+                              setTrackPickerOpen(false);
+                              if (roomCode) {
+                                const tn = t.name;
+                                syncTrackToConvex(roomCode, t.id, selectedAlbum, tn);
+                              }
+                            }}
+                          >
+                            <span className="rd-track-item-num">{String(i + 1).padStart(2, '0')}</span>
+                            <span className="rd-track-item-name">{toProperCase(t.name)}</span>
+                            {active && (
+                              <span className="rd-track-item-active" aria-hidden="true">
+                                <svg viewBox="0 0 14 14" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                  <path d="M3 7l3 3 5-6" />
+                                </svg>
+                              </span>
+                            )}
+                          </button>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </div>
+              )}
+            </div>
+
+            <div className="rd-progress">
+              <div className="rd-progress-times">
+                <span>{elapsedLabel}</span>
+                <span>{remainingLabel}</span>
+              </div>
+              <input
+                type="range"
+                min={0}
+                max={Math.max(0, trackDurationMs)}
+                step={250}
+                value={Math.min(currentProgressMs, trackDurationMs || 0)}
+                disabled={!canSeek}
+                className="rd-range"
+                style={{ '--range-progress': `${progressPercent}%` }}
+                onPointerDown={() => setIsSeeking(true)}
+                onChange={(e) => setSeekPreviewMs(Number(e.target.value))}
+                onPointerUp={(e) => {
+                  const nextMs = Number(e.currentTarget.value);
+                  setIsSeeking(false);
+                  setSeekPreviewMs(nextMs);
+                  commitSeek(nextMs);
+                }}
+                onKeyUp={(e) => {
+                  const nextMs = Number(e.currentTarget.value);
+                  setIsSeeking(false);
+                  setSeekPreviewMs(nextMs);
+                  commitSeek(nextMs);
+                }}
+                aria-label="Playback position"
+              />
+            </div>
+
+            <div className="rd-transport">
+              <button
+                className="rd-tbtn"
+                onClick={() => void stepTrack(-1)}
+                disabled={!hasPrevTrack}
+                title="Previous track"
+                aria-label="Previous track"
+              >
+                <TechIcon size={16} strokeWidth={0}>
+                  <path d="M11 19L3 12l8-7v14z" fill="currentColor" stroke="none" />
+                  <path d="M21 19l-8-7 8-7v14z" fill="currentColor" stroke="none" />
+                </TechIcon>
+              </button>
+
+              {showPause ? (
+                <button
+                  className="rd-playbtn"
+                  onClick={handlePause}
+                  title="Pause room playback"
+                  aria-label="Pause"
+                >
+                  <TechIcon size={24} strokeWidth={0}>
+                    <rect x="7" y="5" width="4" height="14" rx="1.4" fill="currentColor" />
+                    <rect x="13" y="5" width="4" height="14" rx="1.4" fill="currentColor" />
+                  </TechIcon>
+                </button>
+              ) : (
+                <button
+                  className="rd-playbtn"
+                  onClick={handlePlay}
+                  disabled={!socketConnected || loadingAudio || playButtonLocked || countdown !== null || syncPhase === 'preparing'}
+                  title="Start synchronized playback"
+                  aria-label="Play"
+                >
+                  <TechIcon size={22} strokeWidth={0}>
+                    <path d="M8 6l10 6-10 6z" fill="currentColor" />
+                  </TechIcon>
+                </button>
+              )}
+
+              <button
+                className="rd-tbtn"
+                onClick={() => void stepTrack(1)}
+                disabled={!hasNextTrack}
+                title="Next track"
+                aria-label="Next track"
+              >
+                <TechIcon size={16} strokeWidth={0}>
+                  <path d="M13 19l8-7-8-7v14z" fill="currentColor" stroke="none" />
+                  <path d="M3 19l8-7-8-7v14z" fill="currentColor" stroke="none" />
+                </TechIcon>
               </button>
             </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '12px', color: 'var(--text-tertiary)', fontSize: '12px' }}>
-              <div style={{ flex: 1, height: 1, background: 'var(--border-color)' }} />
-              or
-              <div style={{ flex: 1, height: 1, background: 'var(--border-color)' }} />
-            </div>
-            <button
-              onClick={handleCreate}
-              disabled={!socketConnected}
-              style={{
-                width: '100%', padding: '14px', fontSize: '14px', fontWeight: 500,
-                border: '1px solid var(--border-color)', borderRadius: '4px',
-                background: 'transparent', color: 'var(--text-secondary)',
-                cursor: socketConnected ? 'pointer' : 'not-allowed',
-                opacity: socketConnected ? 1 : 0.5,
-              }}
-            >
-              Create Room
-            </button>
-          </div>
 
-          {/* How it works */}
-          <div className="realdac-card" style={{ padding: '24px' }}>
-            <div style={{ fontSize: '10px', fontWeight: 700, letterSpacing: '0.1em', textTransform: 'uppercase', color: 'var(--text-tertiary)', marginBottom: '12px' }}>
-              How it works
+            <div className="rd-readout">
+              <span>{syncMetaLabel || 'Anchor locked'}</span>
+              <span className="rd-readout-sep">·</span>
+              <span>{canSeek ? 'Drag to seek' : 'Press play to begin'}</span>
             </div>
-            {[
-              ['1', 'One person creates a room'],
-              ['2', 'Share the 6-digit code with friends'],
-              ['3', 'Everyone joins the room'],
-              ['4', 'Anyone can play, pause, or change the song — syncs for all'],
-            ].map(([n, text]) => (
-              <div key={n} style={{ display: 'flex', alignItems: 'flex-start', gap: '10px', marginBottom: '8px' }}>
-                <span style={{
-                  minWidth: '20px', height: '20px', borderRadius: '50%',
-                  background: 'var(--border-color)',
-                  display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  fontSize: '11px', fontWeight: 700, color: 'var(--text-secondary)', flexShrink: 0,
-                }}>
-                  {n}
-                </span>
-                <span style={{ fontSize: '13px', color: 'var(--text-secondary)', lineHeight: 1.5 }}>{text}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
+          </article>
 
-      {/* ========== ROOM / PLAYER SCREEN ========== */}
-      {screen === 'room' && (
-        <div className="realdac-room-shell">
-          <div className="realdac-room-stage">
-            <div className="realdac-tech-panel">
-              <div className="realdac-console-header">
-                <div className="realdac-console-brand">
-                  <button className="realdac-panel-button" onClick={handleLeave} title="Leave room">
-                    <TechIcon size={18}>
-                      <path d="M15 18l-6-6 6-6" />
-                      <path d="M21 12H9" />
-                    </TechIcon>
-                  </button>
-                  <div>
-                    <div className="realdac-console-kicker">Now Playing</div>
-                    <div className="realdac-console-title">GradeX RealDac</div>
+          {/* ─── Sidebar stack ─── */}
+          <aside className="rd-side">
+            {/* Roster + Invite */}
+            <div className="rd-card rd-card-pad">
+              <div className="rd-card-title">Roster & Invite</div>
+              <div className="rd-roster">
+                <div className="rd-roster-meta">
+                  <div className="rd-avatars" aria-label={`${safeParticipants} listeners`}>
+                    {avatarSeeds.map((i) => {
+                      const hues = [188, 200, 210, 175, 220];
+                      const hue = hues[i % hues.length];
+                      const initials = ['LA', 'LB', 'LC', 'LD', 'LE'][i] || 'L' + (i + 1);
+                      return (
+                        <span
+                          key={i}
+                          className="rd-av"
+                          style={{
+                            background: `linear-gradient(180deg, hsl(${hue} 70% 28%), hsl(${hue} 60% 18%))`,
+                            color: `hsl(${hue} 90% 88%)`,
+                          }}
+                          title={`Listener ${i + 1}`}
+                        >
+                          {initials}
+                        </span>
+                      );
+                    })}
+                    {overflowCount > 0 && (
+                      <span className="rd-av rd-av--more">+{overflowCount}</span>
+                    )}
+                    {safeParticipants === 0 && (
+                      <span className="rd-av rd-av--more" style={{ marginLeft: 0 }}>—</span>
+                    )}
                   </div>
-                </div>
-                <div className="realdac-console-meta">
-                  <span className="realdac-tech-chip realdac-tech-chip-muted">#{roomCode}</span>
-                  <span className="realdac-tech-chip realdac-tech-chip-muted">
-                    <TechIcon size={14} strokeWidth={1.7}>
-                      <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
-                      <circle cx="9" cy="7" r="4" />
-                      <path d="M22 21v-2a4 4 0 0 0-3-3.87" />
-                      <path d="M16 3.13a4 4 0 0 1 0 7.75" />
-                    </TechIcon>
-                    {participants} {participants === 1 ? 'listener' : 'listeners'}
-                  </span>
-                  <span className="realdac-tech-chip" style={{ color: syncBadge.tone, borderColor: `${syncBadge.tone}44` }}>
-                    <span style={{ width: 7, height: 7, borderRadius: '50%', background: syncBadge.tone, boxShadow: `0 0 12px ${syncBadge.tone}` }} />
-                    {syncBadge.label}
-                  </span>
-                </div>
-              </div>
-
-              <div className="realdac-mobile-room-access">
-                <div className="realdac-sidebar-title">Room Access</div>
-                <div className="realdac-room-code-display">
-                  <div>
-                    <div style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.16em', color: 'rgba(137,160,166,0.82)', fontWeight: 700, marginBottom: 6 }}>
-                      Join code
+                  <div style={{ textAlign: 'right' }}>
+                    <div className="rd-roster-count">
+                      <strong>{safeParticipants}</strong>
+                      {safeParticipants === 1 ? 'listener' : 'listeners'}
                     </div>
-                    <div className="realdac-room-code-value">{roomCode}</div>
-                  </div>
-                  <span className="realdac-tech-chip" style={{ color: syncBadge.tone, borderColor: `${syncBadge.tone}44` }}>
-                    <span style={{ width: 7, height: 7, borderRadius: '50%', background: syncBadge.tone }} />
-                    {participants} live
-                  </span>
-                </div>
-              </div>
-
-              <div className="realdac-tech-art">
-                <div className="realdac-tech-art-grid" />
-                <div className="realdac-tech-art-core" />
-                <img className="realdac-tech-art-logo" src="/arc-reactor1.png" alt="" />
-                <div className="realdac-tech-art-label">
-                  <span className="realdac-tech-code">{artFrameLabel}</span>
-                  <span className="realdac-tech-tag">
-                    <span style={{ width: 7, height: 7, borderRadius: '50%', background: '#00f2ff', boxShadow: '0 0 12px rgba(0,242,255,0.65)' }} />
-                    HD Lossless
-                  </span>
-                </div>
-                <div className="realdac-tech-art-footer">
-                  <span className="realdac-muted-readout">
-                    <span style={{ width: 6, height: 6, borderRadius: '50%', background: syncBadge.tone, boxShadow: `0 0 10px ${syncBadge.tone}` }} />
-                    {syncBadge.label}
-                  </span>
-                </div>
-              </div>
-
-              <h2 className="realdac-hud-title" style={{ letterSpacing: '-0.02em' }}>{displayTrackName}</h2>
-              <div className="realdac-hud-subtitle">
-                <span style={{ color: '#81e8ff', fontWeight: 600 }}>{displayAlbumName}</span>
-                <span style={{ opacity: 0.4 }}>•</span>
-                <span>{syncBadge.detail}</span>
-              </div>
-
-              <div className="realdac-progress-shell">
-                <div className="realdac-progress-meta">
-                  <div className="realdac-time-cluster">
-                    <span className="realdac-time-value">{formatTime(currentProgressMs)}</span>
-                    <span className="realdac-time-label">Elapsed</span>
-                  </div>
-                  <div className="realdac-time-cluster" style={{ alignItems: 'flex-end' }}>
-                    <span className="realdac-time-value">{formatTime(remainingMs)}</span>
-                    <span className="realdac-time-label">Remaining</span>
+                    <div className="rd-roster-detail">{readinessLabel}</div>
                   </div>
                 </div>
 
-                <input
-                  type="range"
-                  min={0}
-                  max={Math.max(0, trackDurationMs)}
-                  step={250}
-                  value={Math.min(currentProgressMs, trackDurationMs || 0)}
-                  disabled={!canSeek}
-                  className="realdac-range"
-                  style={{ '--range-progress': `${progressPercent}%` }}
-                  onPointerDown={() => setIsSeeking(true)}
-                  onChange={(e) => setSeekPreviewMs(Number(e.target.value))}
-                  onPointerUp={(e) => {
-                    const nextMs = Number(e.currentTarget.value);
-                    setIsSeeking(false);
-                    setSeekPreviewMs(nextMs);
-                    commitSeek(nextMs);
-                  }}
-                  onKeyUp={(e) => {
-                    const nextMs = Number(e.currentTarget.value);
-                    setIsSeeking(false);
-                    setSeekPreviewMs(nextMs);
-                    commitSeek(nextMs);
-                  }}
-                />
-
-                <div className="realdac-tech-readout">
-                  <span>24-bit / 192kHz</span>
-                  <span>{syncMetaLabel}</span>
-                  <span>{canSeek ? 'Drag to room-seek' : 'Playback required to seek'}</span>
-                </div>
-              </div>
-
-              <div className="realdac-tech-controls">
-                <button className="realdac-panel-button" onClick={() => void stepTrack(-1)} disabled={!hasPrevTrack} title="Previous track">
-                  <TechIcon size={20}>
-                    <path d="M11 19L3 12l8-7v14z" fill="currentColor" stroke="none" />
-                    <path d="M21 19l-8-7 8-7v14z" fill="currentColor" stroke="none" />
-                  </TechIcon>
-                </button>
-
-                {shouldShowPauseButton ? (
-                  <button className="realdac-reactor-button" onClick={handlePause} title="Pause room playback">
-                    <TechIcon size={28} strokeWidth={0}>
-                      <rect x="7" y="5" width="4" height="14" rx="1.4" fill="currentColor" />
-                      <rect x="13" y="5" width="4" height="14" rx="1.4" fill="currentColor" />
-                    </TechIcon>
-                  </button>
+                {qrDataUrl ? (
+                  <div className="rd-qr">
+                    <img src={qrDataUrl} alt={`Scan to join room ${roomCode}`} style={{ width: 152, height: 152 }} />
+                    <span className="rd-qr-hint">Scan to join</span>
+                  </div>
                 ) : (
-                  <button
-                    className="realdac-reactor-button"
-                    onClick={handlePlay}
-                    disabled={!socketConnected || loadingAudio || playButtonLocked || countdown !== null || syncPhase === 'preparing'}
-                    title="Start synchronized playback"
-                  >
-                    <TechIcon size={24} strokeWidth={0}>
-                      <path d="M8 6l10 6-10 6z" fill="currentColor" />
-                    </TechIcon>
-                  </button>
+                  <div className="rd-qr" style={{ minHeight: 152, alignItems: 'center', justifyContent: 'center', background: 'var(--surface-1)', color: 'var(--ink-faint)', fontSize: 12 }}>
+                    Generating QR…
+                  </div>
                 )}
 
-                <button className="realdac-panel-button" onClick={() => void stepTrack(1)} disabled={!hasNextTrack} title="Next track">
-                  <TechIcon size={20}>
-                    <path d="M13 19l8-7-8-7v14z" fill="currentColor" stroke="none" />
-                    <path d="M3 19l8-7-8-7v14z" fill="currentColor" stroke="none" />
-                  </TechIcon>
-                </button>
-              </div>
-
-              <div className="realdac-diagnostics">
-                <div className="realdac-diagnostics-users">
-                  <span className="realdac-user-pip">GX</span>
-                  <span className="realdac-user-pip" style={{ opacity: 0.82 }}>RD</span>
-                  <span style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                    <span style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.14em', color: 'rgba(137,160,166,0.82)', fontWeight: 700 }}>
-                      Listener readiness
-                    </span>
-                    <span style={{ fontSize: 13, color: '#dffcff', fontWeight: 700 }}>
-                      {readinessLabel}
-                    </span>
-                  </span>
+                <div className="rd-field">
+                  <span className="rd-field-label">Invite link</span>
+                  <span className="rd-link">{inviteUrl}</span>
+                  <button
+                    type="button"
+                    className="rd-btn rd-btn--lg"
+                    onClick={() => void copyToClipboard(inviteUrl, 'Invite link copied')}
+                  >
+                    <TechIcon size={14} strokeWidth={1.8}>
+                      <path d="M15 7h3a5 5 0 0 1 0 10h-3" />
+                      <path d="M9 17H6A5 5 0 0 1 6 7h3" />
+                      <path d="M8 12h8" />
+                    </TechIcon>
+                    {linkCopied ? 'Copied' : 'Copy invite link'}
+                  </button>
                 </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-                  <span className="realdac-muted-readout">{syncMetaLabel}</span>
-                  <span className="realdac-muted-readout">{statusMessage || syncBadge.detail || 'Anchor locked'}</span>
-                </div>
-              </div>
-
-              <div className="realdac-action-grid">
-                <button className="realdac-command-button" onClick={() => void copyToClipboard(roomCode, 'Room code copied')}>
-                  <TechIcon size={18}>
-                    <rect x="9" y="9" width="11" height="11" rx="2" />
-                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
-                  </TechIcon>
-                  Copy Room
-                </button>
-                <button className="realdac-command-button" onClick={() => void handleShareInvite()}>
-                  <TechIcon size={18}>
-                    <path d="M14 9l-8 4 8 4" />
-                    <path d="M18 5a3 3 0 1 0 0.001 6.001A3 3 0 0 0 18 5z" />
-                    <path d="M6 10a3 3 0 1 0 0.001 6.001A3 3 0 0 0 6 10z" />
-                    <path d="M18 13a3 3 0 1 0 0.001 6.001A3 3 0 0 0 18 13z" />
-                  </TechIcon>
-                  Invite
-                </button>
-                <button className="realdac-command-button realdac-command-button-danger" onClick={handleLeave}>
-                  <TechIcon size={18}>
-                    <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
-                    <path d="M16 17l5-5-5-5" />
-                    <path d="M21 12H9" />
-                  </TechIcon>
-                  Leave Room
-                </button>
               </div>
             </div>
 
-            <div className="realdac-sidebar-stack">
-              <div className="realdac-tech-panel">
-                <div className="realdac-sidebar-title">Room Access</div>
-                <div className="realdac-sidebar-block">
-                  <div className="realdac-room-code-display">
-                    <div>
-                      <div style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.16em', color: 'rgba(137,160,166,0.82)', fontWeight: 700, marginBottom: 6 }}>
-                        Join code
-                      </div>
-                      <div className="realdac-room-code-value">{roomCode}</div>
-                    </div>
-                    <span className="realdac-tech-chip" style={{ color: syncBadge.tone, borderColor: `${syncBadge.tone}44` }}>
-                      <span style={{ width: 7, height: 7, borderRadius: '50%', background: syncBadge.tone }} />
-                      {participants} live
-                    </span>
-                  </div>
-
-                  {qrDataUrl ? (
-                    <div className="realdac-qr-shell">
-                      <img className="realdac-qr-img" src={qrDataUrl} alt={`Scan to join room ${roomCode}`} style={{ display: 'block', width: 168, height: 168 }} />
-                      <div style={{ fontSize: 11, fontWeight: 700, color: '#475569', letterSpacing: '0.12em', textTransform: 'uppercase' }}>
-                        Scan to join
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="realdac-mini-note" style={{ minHeight: 90, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                      Generating QR invite…
-                    </div>
-                  )}
-
-                  <div>
-                    <div style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.16em', color: 'rgba(137,160,166,0.82)', fontWeight: 700, marginBottom: 8 }}>
-                      Invite link
-                    </div>
-                    <div className="realdac-mini-note" style={{ wordBreak: 'break-all', marginBottom: 10 }}>
-                      {inviteUrl}
-                    </div>
-                    <button className="realdac-command-button" style={{ minHeight: 54 }} onClick={() => void copyToClipboard(inviteUrl, 'Invite link copied')}>
-                      <TechIcon size={18}>
-                        <path d="M15 7h3a5 5 0 0 1 0 10h-3" />
-                        <path d="M9 17H6A5 5 0 0 1 6 7h3" />
-                        <path d="M8 12h8" />
-                      </TechIcon>
-                      {linkCopied ? 'Copied' : 'Copy Invite Link'}
-                    </button>
-                  </div>
-                </div>
-              </div>
-
-              <div className="realdac-tech-panel">
-                <div className="realdac-sidebar-title">Source Control</div>
-                <div className="realdac-sidebar-block">
-                  {albums.length > 1 && (
+            {/* Library */}
+            <div className="rd-card rd-card-pad">
+              <div className="rd-card-title">Library</div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-3)' }}>
+                {albums.length > 1 && (
+                  <div className="rd-field">
+                    <span className="rd-field-label">Album</span>
                     <select
                       value={selectedAlbum}
                       onChange={(e) => {
@@ -2824,54 +2253,48 @@ export default function RealDac() {
                           syncTrackToConvex(roomCode, t, albumId, tn);
                         }
                       }}
-                      className="realdac-input-shell"
+                      className="rd-select"
                     >
                       {albums.map((a) => (
-                        <option key={a.id} value={a.id}>Album: {toProperCase(a.name)}</option>
+                        <option key={a.id} value={a.id}>{toProperCase(a.name)}</option>
                       ))}
                     </select>
-                  )}
-
-                  <select
-                    value={selectedTrack}
-                    onChange={(e) => {
-                      const trackId = e.target.value;
-                      setSelectedTrack(trackId);
-                      if (roomCode) {
-                        const tn = tracks.find((t) => t.id === trackId)?.name;
-                        syncTrackToConvex(roomCode, trackId, selectedAlbum, tn);
-                      }
-                    }}
-                    className="realdac-input-shell"
-                  >
-                    {tracks.map((t) => (
-                      <option key={t.id} value={t.id}>{toProperCase(t.name)}</option>
-                    ))}
-                  </select>
-
-                  <div>
-                    <div style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.16em', color: 'rgba(137,160,166,0.82)', fontWeight: 700, marginBottom: 10 }}>
-                      Output gain
-                    </div>
-                    <input
-                      type="range"
-                      min="0"
-                      max="1"
-                      step="0.01"
-                      value={volume}
-                      onChange={(e) => setVolume(Number(e.target.value))}
-                      className="realdac-range"
-                      style={{ '--range-progress': `${Math.round(volume * 100)}%` }}
-                    />
-                    <div className="realdac-mini-note" style={{ marginTop: 8 }}>
-                      Reactor gain {Math.round(volume * 100)}%
-                    </div>
                   </div>
+                )}
+
+                <div className="rd-field">
+                  <span className="rd-field-label">Track</span>
+                  <p className="rd-field-hint">
+                    Tap the song name above the disc to switch tracks.
+                  </p>
+                </div>
+
+                <div className="rd-field">
+                  <div className="rd-volume-row">
+                    <span className="rd-field-label" style={{ margin: 0 }}>Volume</span>
+                    <span className="rd-volume-value">{Math.round(volume * 100)}%</span>
+                  </div>
+                  <input
+                    type="range"
+                    min="0"
+                    max="1"
+                    step="0.01"
+                    value={volume}
+                    onChange={(e) => setVolume(Number(e.target.value))}
+                    className="rd-range"
+                    style={{ '--range-progress': `${Math.round(volume * 100)}%` }}
+                    aria-label="Volume"
+                  />
                 </div>
               </div>
             </div>
-          </div>
-        </div>
+          </aside>
+        </section>
+      )}
+
+      {/* Subtle status toast for non-critical messages */}
+      {statusMessage && screen === 'room' && (
+        <div className="rd-toast" role="status" aria-live="polite">{statusMessage}</div>
       )}
     </div>
   );
