@@ -25,7 +25,10 @@ const FALLBACK_ALBUM = {
   songs: [{ id: DEFAULT_REALDAC_TRACK, name: 'blue eyes' }],
 };
 const COUNTDOWN_SEC = 3;
-const TIME_SYNC_SAMPLES = 3;
+// Burst size for offset measurement. More samples = better min-RTT pick.
+// 7 hits the sweet spot recommended by NTP RFC 5905 for burst mode.
+// Cross-network this trades ~200ms of handshake time for ~30-60ms of accuracy.
+const TIME_SYNC_SAMPLES = 7;
 const RECONNECT_REJOIN_DELAY = 500; // ms to wait before rejoining after reconnect
 const SEEK_LEAD_MS = 350;
 const CATCHUP_LEAD_MS = 900;
@@ -80,9 +83,9 @@ function deriveSyncProfile(network, jitterMs = 0, reconnecting = false) {
   if (weak) {
     profile = {
       ...profile,
-      syncSamples: 4,
-      syncTimeoutMs: 6500,
-      syncSampleGapMs: 80,
+      syncSamples: 10,
+      syncTimeoutMs: 8000,
+      syncSampleGapMs: 90,
       offsetRefreshMs: 14000,
       driftCheckMs: 1200,
       driftIgnoreMs: 80,
@@ -100,8 +103,9 @@ function deriveSyncProfile(network, jitterMs = 0, reconnecting = false) {
   if (highRtt || highJitter) {
     profile = {
       ...profile,
-      syncSamples: Math.max(profile.syncSamples, 5),
-      syncTimeoutMs: Math.max(profile.syncTimeoutMs, 7000),
+      syncSamples: Math.max(profile.syncSamples, 12),
+      syncTimeoutMs: Math.max(profile.syncTimeoutMs, 9000),
+      syncSampleGapMs: Math.max(profile.syncSampleGapMs, 110),
       seekLeadMs: Math.max(profile.seekLeadMs, 640),
       catchupLeadMs: Math.max(profile.catchupLeadMs, 1450),
       driftIgnoreMs: Math.max(profile.driftIgnoreMs, 95),
@@ -115,7 +119,7 @@ function deriveSyncProfile(network, jitterMs = 0, reconnecting = false) {
   if (reconnecting) {
     profile = {
       ...profile,
-      syncSamples: Math.max(profile.syncSamples, 5),
+      syncSamples: Math.max(profile.syncSamples, 10),
       offsetRefreshMs: Math.min(profile.offsetRefreshMs, 9000),
       driftCheckMs: Math.max(profile.driftCheckMs, 1250),
       seekLeadMs: Math.max(profile.seekLeadMs, 680),
@@ -203,6 +207,29 @@ function getRoomPlaybackRecovery(playState, serverNow) {
     startedAtServerMs: startedAt,
     seekOffsetSec: Math.max(0, baseOffsetSec + Math.max(0, (serverNow - startedAt) / 1000)),
   };
+}
+
+/**
+ * Monotonic wall-clock approximation for cross-device sync.
+ *
+ * Returns ms-since-epoch like Date.now(), BUT derived from performance.now()
+ * which is monotonic and immune to OS clock adjustments. Critical for sync:
+ * the OS can nudge Date.now() by 20-80ms when its NTP daemon corrects time
+ * (common on iOS, Android, Windows). That nudge would silently invalidate
+ * our cached offset and cause audible drift mid-playback. performance.now()
+ * isn't touched by OS clock corrections — it only moves forward at the
+ * hardware clock rate.
+ *
+ * performance.timeOrigin is captured once at page navigation. The sum
+ * (timeOrigin + now()) is "wall-clock time as seen at startup, advanced
+ * monotonically since". For sync deltas against a server's Date.now(),
+ * that's exactly what we want.
+ */
+function clientNow() {
+  if (typeof performance !== 'undefined' && performance.timeOrigin != null) {
+    return performance.timeOrigin + performance.now();
+  }
+  return Date.now();
 }
 
 function TechIcon({ size = 20, strokeWidth = 1.8, children, style, ...props }) {
@@ -423,10 +450,10 @@ export default function RealDac() {
       try {
         const sample = await new Promise((resolve, reject) => {
           const timeout = setTimeout(() => reject(new Error('Timeout')), syncTimeoutMs);
-          const clientSend = Date.now();
+          const clientSend = clientNow();
           socket.emit('TIME_SYNC_REQ', clientSend, (data) => {
             clearTimeout(timeout);
-            const clientRecv = Date.now();
+            const clientRecv = clientNow();
             const rtt = clientRecv - clientSend;
             resolve({
               offset: data.serverTime - (clientSend + rtt / 2),
@@ -579,7 +606,7 @@ export default function RealDac() {
   const startCountdown = useCallback((playAtMs) => {
     if (countdownTimerRef.current) clearInterval(countdownTimerRef.current);
     const tick = () => {
-      const serverNow = Date.now() + offsetRef.current;
+      const serverNow = clientNow() + offsetRef.current;
       const remaining = (playAtMs - serverNow) / 1000;
       if (remaining <= 0) {
         clearInterval(countdownTimerRef.current);
@@ -635,7 +662,7 @@ export default function RealDac() {
 
     const offset = offsetRef.current;
     const playAtClient = playAtServerMs - offset;
-    const delayMs = Math.max(0, playAtClient - Date.now());
+    const delayMs = Math.max(0, playAtClient - clientNow());
     const startAt = ctx.currentTime + delayMs / 1000;
     const safeOffsetSec = Math.max(0, Math.min(startOffsetSec, Math.max(0, buf.duration - 0.05)));
 
@@ -745,7 +772,7 @@ export default function RealDac() {
       setLoadingAudio(false);
     }
 
-    const serverNow = Date.now() + offsetRef.current;
+    const serverNow = clientNow() + offsetRef.current;
     const hasFutureCommit = Number.isFinite(playbackState.playAtServerMs) && playbackState.playAtServerMs > serverNow + 120;
     if (hasFutureCommit) {
       await schedulePlay(
@@ -788,7 +815,7 @@ export default function RealDac() {
     if (!playState?.track) return false;
 
     await measureOffset();
-    const serverNow = Date.now() + offsetRef.current;
+    const serverNow = clientNow() + offsetRef.current;
     const recovery = getRoomPlaybackRecovery(playState, serverNow);
     if (!recovery) return false;
 
@@ -1091,7 +1118,7 @@ export default function RealDac() {
           setRoomStatus('Loading…');
           await loadBufferRef.current?.(seekTrack);
         }
-        const serverNow = Date.now() + offsetRef.current;
+        const serverNow = clientNow() + offsetRef.current;
         const liveOffsetSec = Math.max(0, Number(position || 0) + Math.max(0, serverNow - Number(serverTime || serverNow)) / 1000);
         await schedulePlayRef.current?.(seekTrack, serverNow + syncProfileRef.current.seekLeadMs, liveOffsetSec, {
           force: true,
@@ -1146,7 +1173,7 @@ export default function RealDac() {
     });
 
     socket.on('SYNC_TICK', ({ serverTime }) => {
-      offsetRef.current = serverTime - Date.now();
+      offsetRef.current = serverTime - clientNow();
     });
 
     socket.on('PARTICIPANT_JOINED', ({ count }) => {
@@ -1447,7 +1474,7 @@ export default function RealDac() {
       const name = resolvedTrack.trackName;
       syncTrackToConvex(roomCode, playableTrackId, albumId, name).catch(() => {});
 
-      const serverNow = Date.now() + offsetRef.current;
+      const serverNow = clientNow() + offsetRef.current;
       const playAt = serverNow + COUNTDOWN_SEC * 1000;
 
       setRoomStatus('Preparing');
@@ -1541,7 +1568,7 @@ export default function RealDac() {
         setTrackDurationMs(buffer.duration * 1000);
       }
 
-      const serverNow = Date.now() + offsetRef.current;
+      const serverNow = clientNow() + offsetRef.current;
 
       await schedulePlay(track, serverNow + syncProfileRef.current.seekLeadMs, positionSec, {
         force: true,
@@ -1679,7 +1706,7 @@ export default function RealDac() {
   useEffect(() => {
     if (!isPlaying || countdown !== null) return;
     const tick = () => {
-      const elapsed = Date.now() + offsetRef.current - playStartTimeRef.current;
+      const elapsed = clientNow() + offsetRef.current - playStartTimeRef.current;
       setProgressMs(Math.max(0, Math.min(trackDurationRef.current || 0, elapsed)));
     };
     tick();
@@ -1864,7 +1891,7 @@ export default function RealDac() {
         return;
       }
 
-      const serverNow = Date.now() + offsetRef.current;
+      const serverNow = clientNow() + offsetRef.current;
       const expectedMs = Math.max(
         0,
         (playback.anchorOffsetSec || 0) * 1000 + Math.max(0, serverNow - playback.anchorStartedAtServerMs)
