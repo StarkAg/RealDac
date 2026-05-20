@@ -79,7 +79,14 @@ app.use('/realdac-songs', (req, res, next) => {
   if (!file || file.includes('..')) return next();
   const fp = join(__dirname, 'public', 'realdac-songs', file);
   if (fs.existsSync(fp) && fs.statSync(fp).isFile()) {
-    return res.type('audio/mpeg').sendFile(fp);
+    // Static MP3s never change — let browsers cache for a year and skip revalidation.
+    // Huge win for mobile users joining a room: subsequent loads are instant.
+    return res
+      .type('audio/mpeg')
+      .set({
+        'Cache-Control': 'public, max-age=31536000, immutable',
+      })
+      .sendFile(fp);
   }
   next();
 });

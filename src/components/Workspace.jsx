@@ -95,32 +95,22 @@ export default function Workspace() {
   // 1–3s. This is "instant join" — the buffering badge barely flashes.
   useEffect(() => {
     let cancelled = false;
-    const warm = async () => {
+    // Fire immediately. The fetch goes on the network anyway; no point
+    // delaying — first paint is already done before this effect runs.
+    (async () => {
       try {
         const r = await fetch('/api/realdac/songs');
         if (!r.ok || cancelled) return;
         const data = await r.json();
         const songs = Array.isArray(data?.songs) ? data.songs : [];
-        // Fetch the first song's bytes (browser caches them); other songs are
-        // prefetched as low-priority <link> hints so we don't saturate bandwidth.
+        // Eagerly download the first song's bytes (cached aggressively now
+        // that the server returns Cache-Control: immutable).
         if (songs[0]?.id) {
-          fetch(songs[0].id, { cache: 'force-cache' }).catch(() => {});
+          fetch(songs[0].id, { cache: 'force-cache', priority: 'high' }).catch(() => {});
         }
-        for (const s of songs.slice(1, 6)) {
-          if (cancelled) break;
-          const link = document.createElement('link');
-          link.rel = 'prefetch';
-          link.as = 'audio';
-          link.href = s.id;
-          document.head.appendChild(link);
-        }
-      } catch {
-        /* prefetch is best-effort */
-      }
-    };
-    // Defer so we don't compete with the first paint / route hydration.
-    const id = setTimeout(warm, 800);
-    return () => { cancelled = true; clearTimeout(id); };
+      } catch { /* best-effort */ }
+    })();
+    return () => { cancelled = true; };
   }, []);
 
   const ensureSocket = useCallback(() => {
