@@ -601,7 +601,9 @@ button, input, textarea, select { font: inherit; }
   background: transparent;
   color: transparent;
   caret-color: transparent;
-  font-size: 1px;
+  /* iOS Safari zooms the page on focus if input font-size < 16px. The text
+     is rendered transparent so the visual size doesn't matter. */
+  font-size: 16px;
   letter-spacing: 1ch;
   z-index: 2;
   cursor: text;
@@ -2097,4 +2099,105 @@ button, input, textarea, select { font: inherit; }
 .rd-tap-overlay-text small {
   font-size: 12px;
   color: var(--ink-muted);
+}
+
+/* =============================================================
+   iOS zoom guard + phone optimisations
+   ============================================================= */
+
+/* iOS Safari zooms the viewport when any focused input has font-size < 16px.
+   Force 16px on focusable text inputs so focus never triggers a zoom.
+   (Doesn't disable pinch-zoom — that stays available for accessibility.) */
+input[type="text"],
+input[type="number"],
+input[type="email"],
+input[type="search"],
+input[type="tel"],
+input[type="url"],
+input[type="password"],
+input:not([type]),
+select,
+textarea {
+  font-size: 16px;
+}
+
+/* Phone-specific layout polish (≤ 600px) ---------------------- */
+@media (max-width: 600px) {
+  /* Bigger, easier-to-tap transport buttons */
+  .rd-tbtn   { width: 48px; height: 48px; }
+  .rd-playbtn { width: 72px; height: 72px; }
+  .rd-playbtn svg { width: 26px; height: 26px; }
+
+  /* Disc shrinks to leave headroom for the now-playing meta */
+  .rd-disc { width: 170px; }
+
+  /* Tighter card padding, more screen real estate */
+  .rd-now { padding: var(--space-4) var(--space-3) var(--space-3); }
+  .rd-card-pad { padding: var(--space-4); }
+
+  /* Track title sits a bit closer to disc */
+  .rd-track-trigger .rd-track-title { font-size: 19px; }
+  .rd-track-sub { font-size: 12.5px; flex-wrap: wrap; justify-content: center; }
+
+  /* Roster + invite + library cards stack with smaller chrome */
+  .rd-side { gap: var(--space-3); }
+  .rd-invite-code { font-size: 24px; letter-spacing: 0.18em; padding: 10px 0; }
+  .rd-qr img { width: 132px !important; height: 132px !important; }
+  .rd-link { font-size: 11px; padding: 8px 10px; }
+
+  /* Roster avatars sized for thumbs */
+  .rd-av { width: 30px; height: 30px; font-size: 10.5px; }
+
+  /* Volume row stays a single line */
+  .rd-volume-row { font-size: 12px; }
+
+  /* Library select tap-target */
+  .rd-select { padding: 12px var(--space-3); padding-right: 38px; }
+
+  /* Track popover spans almost full width */
+  .rd-track-popover { width: calc(100vw - 24px); }
+
+  /* Workspace OTP slots already shrink at 480px — bump touch targets earlier */
+  .code-slot { width: 42px; height: 54px; font-size: 20px; }
+
+  /* Bigger Workspace primary button */
+  .ws-btn { min-height: 50px; font-size: 15px; }
+}
+
+/* Tiny phones (≤ 380px) — squeeze further */
+@media (max-width: 380px) {
+  .code-slot { width: 36px; height: 50px; font-size: 18px; }
+  .code-slots .code-slot:nth-child(4) { margin-left: 6px; }
+  .rd-disc { width: 150px; }
+  .rd-playbtn { width: 64px; height: 64px; }
+  .rd-track-trigger .rd-track-title { font-size: 17px; }
+}
+
+/* Prevent text inflation on rotation */
+html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+
+/* Better tap feedback on iOS — kills the grey flash */
+.ws, .realdac-page, button, a {
+  -webkit-tap-highlight-color: rgba(0, 224, 255, 0.18);
+}
+
+/* Disable double-tap zoom on interactive surfaces (still allows pinch zoom) */
+button, .rd-codechip, .rd-syncpill, .rd-tap-overlay,
+.rd-playbtn, .rd-tbtn, .rd-track-trigger,
+.ws-btn, .ws-iconbtn, .workspace-pill {
+  touch-action: manipulation;
+}
+
+/* iOS safe-area: respect notch / home indicator */
+@supports (padding: max(0px)) {
+  .ws, .realdac-page {
+    padding-left:  max(var(--space-5), env(safe-area-inset-left));
+    padding-right: max(var(--space-5), env(safe-area-inset-right));
+    padding-bottom: max(var(--space-6), env(safe-area-inset-bottom));
+  }
+}
+
+/* Lock scroll bounce behind fixed UI when the room player covers viewport */
+@media (max-width: 600px) {
+  body { overscroll-behavior-y: none; }
 }
