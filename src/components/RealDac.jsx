@@ -1588,7 +1588,7 @@ export default function RealDac() {
   const syncBadge = (() => {
     if (reconnecting) return { label: 'RE-LINKING', tone: '#f59e0b', toneKey: 'reconnecting', detail: 'Recovering room state' };
     if (countdown !== null) return { label: `START ${countdown}`, tone: '#00f2ff', toneKey: 'buffering', detail: 'Commit received' };
-    if (loadingAudio || syncPhase === 'preparing') return { label: 'BUFFERING', tone: '#00f2ff', toneKey: 'buffering', detail: 'Loading current track' };
+    if (loadingAudio || syncPhase === 'preparing') return { label: 'STARTING', tone: '#00f2ff', toneKey: 'buffering', detail: 'Preparing the track' };
     if (syncPhase === 'resyncing') return { label: 'SYNCING', tone: '#10b981', toneKey: 'live', detail: 'Tightening drift' };
     if (syncPhase === 'paused') return { label: 'PAUSED', tone: '#94a3b8', toneKey: 'paused', detail: 'Room playback stopped' };
     if (isPlaying) return { label: 'SYNC LOCK', tone: '#10b981', toneKey: 'live', detail: 'Room playback stable' };

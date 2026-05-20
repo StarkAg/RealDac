@@ -90,6 +90,39 @@ export default function Workspace() {
     return () => { alive = false; clearInterval(id); };
   }, []);
 
+  // Pre-warm the song cache. By the time the user joins a room, the MP3 is in
+  // the HTTP cache → loadBuffer() inside RealDac returns in ~50ms instead of
+  // 1–3s. This is "instant join" — the buffering badge barely flashes.
+  useEffect(() => {
+    let cancelled = false;
+    const warm = async () => {
+      try {
+        const r = await fetch('/api/realdac/songs');
+        if (!r.ok || cancelled) return;
+        const data = await r.json();
+        const songs = Array.isArray(data?.songs) ? data.songs : [];
+        // Fetch the first song's bytes (browser caches them); other songs are
+        // prefetched as low-priority <link> hints so we don't saturate bandwidth.
+        if (songs[0]?.id) {
+          fetch(songs[0].id, { cache: 'force-cache' }).catch(() => {});
+        }
+        for (const s of songs.slice(1, 6)) {
+          if (cancelled) break;
+          const link = document.createElement('link');
+          link.rel = 'prefetch';
+          link.as = 'audio';
+          link.href = s.id;
+          document.head.appendChild(link);
+        }
+      } catch {
+        /* prefetch is best-effort */
+      }
+    };
+    // Defer so we don't compete with the first paint / route hydration.
+    const id = setTimeout(warm, 800);
+    return () => { cancelled = true; clearTimeout(id); };
+  }, []);
+
   const ensureSocket = useCallback(() => {
     if (socketRef.current && socketRef.current.connected) return socketRef.current;
     const s = io({
