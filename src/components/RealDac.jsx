@@ -1198,7 +1198,12 @@ export default function RealDac() {
     const resolvedTrack = resolvePlayableTrack(albumsRef.current, options.track ?? selectedTrack, options.album ?? selectedAlbum);
     const trackToLoad = resolvedTrack.trackId;
     const albumToUse = resolvedTrack.albumId;
-    
+    // Caller (auto-join / socket reconnect) can ask us to skip the audio
+    // preload — needed because browsers refuse to create/resume AudioContext
+    // outside a fresh user gesture, and the navigation that brought us here
+    // doesn't count.
+    const skipAudioWarm = options.skipAudioWarm === true;
+
     roomCodeRef.current = roomCodeStr;
     setRoomCode(roomCodeStr);
     setParticipants(participantCount);
@@ -1209,10 +1214,19 @@ export default function RealDac() {
     navigate(`/${roomCodeStr}`, { replace: true });
     setRoomStatus('');
     setSyncError(null);
-    setLoadingAudio(true);
     setSelectedTrack(trackToLoad);
     setSelectedAlbum(albumToUse);
-    
+
+    if (skipAudioWarm) {
+      // Don't touch AudioContext yet. The track buffer will be loaded the
+      // first time the user taps Play (which IS a gesture). Persist the
+      // selection to Convex so other clients still see the choice.
+      setRoomStatus('Ready');
+      await syncTrackToConvex(roomCodeStr, trackToLoad, albumToUse, resolvedTrack.trackName);
+      return;
+    }
+
+    setLoadingAudio(true);
     try {
       await getAudioCtx();
       const buffer = await loadBuffer(trackToLoad);
@@ -1313,15 +1327,17 @@ export default function RealDac() {
         const { track } = res.playState;
         const albumWithTrack = albums.find((a) => a.songs?.some((s) => s.id === track));
         const albumId = albumWithTrack?.id ?? FALLBACK_ALBUM.id;
-        await enterRoom(res.roomCode, participantCount, { track, album: albumId });
-        // DEFER recovery until first user gesture — browsers (esp. iOS Safari)
-        // require a tap before AudioContext.resume() is allowed.
+        // Skip AudioContext warm-up — navigation isn't a gesture; we'll
+        // unlock + recover on the first tap.
+        await enterRoom(res.roomCode, participantCount, { track, album: albumId, skipAudioWarm: true });
         pendingRecoveryRef.current = res.playState;
         setAwaitingTap(true);
         setRoomStatus('Tap to start');
         setSyncPhase('idle');
       } else {
-        await enterRoom(res.roomCode, participantCount);
+        // Fresh room: no recovery needed, but still skip the audio warm so
+        // we don't trip browser autoplay policy. First Play tap loads it.
+        await enterRoom(res.roomCode, participantCount, { skipAudioWarm: true });
         authoritativePlaybackRef.current = null;
         setSyncPhase('idle');
       }
