@@ -445,18 +445,29 @@ export default function RealDac() {
     }
 
     if (samples.length > 0) {
-      samples.sort((a, b) => a.offset - b.offset);
-      const trimmed = samples.length > 3 ? samples.slice(1, -1) : samples;
-      const totalOffset = trimmed.reduce((sum, sample) => sum + sample.offset, 0);
-      const averageOffset = totalOffset / trimmed.length;
-      const jitterMs = trimmed.length > 1
-        ? Math.max(...trimmed.map((sample) => Math.abs(sample.offset - averageOffset)))
-        : Math.max(0, trimmed[0]?.rtt ?? 0);
+      // NTP-style min-RTT selection.
+      // The offset estimate `serverTime - (clientSend + RTT/2)` is only exact
+      // if the request and response legs took *the same* time. The lower the
+      // RTT, the smaller the bound on that asymmetry. So instead of averaging
+      // all samples (which lets bad samples poison the mean), we sort by RTT
+      // ascending and keep only the lowest-RTT third — then take the median
+      // of their offsets. This is what chrony / browser timesync libraries do
+      // and it cuts cross-network offset error from ±RTT/2 down to ±jitter/2.
+      const byRtt = [...samples].sort((a, b) => a.rtt - b.rtt);
+      const keepK = Math.max(1, Math.ceil(byRtt.length / 3));
+      const best = byRtt.slice(0, keepK).sort((a, b) => a.offset - b.offset);
+      const bestOffset = best[Math.floor(best.length / 2)].offset;
 
-      offsetRef.current = averageOffset;
+      // Jitter = spread among the best samples (used for adaptive profile).
+      const jitterMs = best.length > 1
+        ? Math.max(...best.map((s) => Math.abs(s.offset - bestOffset)))
+        : Math.max(0, best[0]?.rtt ?? 0);
+
+      offsetRef.current = bestOffset;
       timeSyncQualityRef.current = {
         jitterMs,
-        sampleCount: trimmed.length,
+        sampleCount: best.length,
+        bestRttMs: byRtt[0]?.rtt ?? 0,
       };
       refreshSyncProfile({ jitterMs, reconnecting: reconnecting && socket?.connected !== true });
     }
@@ -1865,6 +1876,14 @@ export default function RealDac() {
       const driftMs = expectedMs - actualMs;
 
       if (Math.abs(driftMs) < profile.driftIgnoreMs) {
+        // Within ignore band → also relax any in-flight playbackRate nudge.
+        const src = currentSourceRef.current;
+        if (src && src.playbackRate) {
+          try {
+            src.playbackRate.cancelScheduledValues(ctx.currentTime);
+            src.playbackRate.linearRampToValueAtTime(1, ctx.currentTime + 0.2);
+          } catch {}
+        }
         driftTimer = window.setTimeout(runDriftCheck, Math.max(700, profile.driftCheckMs || DRIFT_CHECK_INTERVAL_MS));
         return;
       }
@@ -1875,6 +1894,44 @@ export default function RealDac() {
 
       driftCorrectionAtRef.current = Date.now();
       const hardResync = Math.abs(driftMs) > profile.driftHardResyncMs;
+
+      // SOFT correction: drift in (ignore, hard) → nudge playbackRate. This is
+      // how broadcast-grade players (e.g. Twitch low-latency, HLS LL) hold
+      // sync — inaudibly stretches/compresses time without re-anchoring.
+      // A 1.5% rate change is ~26 cents of pitch shift; humans can't detect
+      // drift correction below ~30 cents in dense audio content like music.
+      if (!hardResync) {
+        const src = currentSourceRef.current;
+        if (src && src.playbackRate && typeof src.playbackRate.setValueAtTime === 'function') {
+          // driftMs > 0 → we're BEHIND the server clock → speed up.
+          // Correction window: pull the drift back over ~4s.
+          const CORRECTION_WINDOW_MS = 4000;
+          const MAX_RATE_DELTA = 0.015; // ±1.5% — inaudible pitch shift on music
+          const desiredRate = 1 + driftMs / CORRECTION_WINDOW_MS;
+          const rate = Math.max(1 - MAX_RATE_DELTA, Math.min(1 + MAX_RATE_DELTA, desiredRate));
+          try {
+            const now = ctx.currentTime;
+            src.playbackRate.cancelScheduledValues(now);
+            src.playbackRate.setValueAtTime(src.playbackRate.value, now);
+            src.playbackRate.linearRampToValueAtTime(rate, now + 0.1);
+            // Ease back to 1.0 once we've consumed the drift.
+            src.playbackRate.linearRampToValueAtTime(1, now + CORRECTION_WINDOW_MS / 1000);
+            setSyncPhase('resyncing');
+            log(`[RealDac] Soft drift correction: ${driftMs.toFixed(1)}ms → rate ${rate.toFixed(4)}`);
+            // Briefly indicate, then settle back.
+            window.setTimeout(() => setSyncPhase('live'), Math.max(500, CORRECTION_WINDOW_MS - 500));
+            driftTimer = window.setTimeout(runDriftCheck, Math.max(700, profile.driftCheckMs || DRIFT_CHECK_INTERVAL_MS));
+            return;
+          } catch (e) {
+            warn('[RealDac] playbackRate nudge failed, falling back to hard resync:', e?.message);
+            // Fall through to the hard-resync path below.
+          }
+        }
+      }
+
+      // HARD resync: drift exceeded threshold (or no source available)
+      // → re-anchor by scheduling a fresh start. This is audible (small gap)
+      // but only fires for big drifts that can't be hidden via rate.
       const leadMs = hardResync ? profile.catchupLeadMs : profile.seekLeadMs;
       const correctedOffsetSec = Math.max(0, expectedMs / 1000 + leadMs / 1000);
 
