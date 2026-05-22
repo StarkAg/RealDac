@@ -1,0 +1,44 @@
+{
+  "albums": [
+    {
+      "id": "honey-singh",
+      "name": "Honey Singh",
+      "songs": [
+        { "id": "/realdac-songs/honey-singh/blue-eyes.mp3", "name": "blue eyes" },
+        { "id": "/realdac-songs/honey-singh/brown-rang.mp3", "name": "brown rang" },
+        { "id": "/realdac-songs/honey-singh/char-bottle-vodka.mp3", "name": "char bottle vodka" },
+        { "id": "/realdac-songs/honey-singh/desi-kalakaar.mp3", "name": "desi kalakaar" },
+        { "id": "/realdac-songs/honey-singh/dheere-dheere.mp3", "name": "dheere dheere" },
+        { "id": "/realdac-songs/honey-singh/dope-shope.mp3", "name": "dope shope" },
+        { "id": "/realdac-songs/honey-singh/first-kiss.mp3", "name": "first kiss" },
+        { "id": "/realdac-songs/honey-singh/high-heels.mp3", "name": "high heels" },
+        { "id": "/realdac-songs/honey-singh/love-dose.mp3", "name": "love dose" },
+        { "id": "/realdac-songs/honey-singh/lungi-dance.mp3", "name": "lungi dance" },
+        { "id": "/realdac-songs/honey-singh/main-sharabi.mp3", "name": "main sharabi" },
+        { "id": "/realdac-songs/honey-singh/malamaal.mp3", "name": "malamaal" },
+        { "id": "/realdac-songs/honey-singh/millionaire.mp3", "name": "millionaire" },
+        { "id": "/realdac-songs/honey-singh/party-all-night.mp3", "name": "party all night" },
+        { "id": "/realdac-songs/honey-singh/rounds-n-ring.mp3", "name": "rounds n ring" },
+        { "id": "/realdac-songs/honey-singh/sunny-sunny.mp3", "name": "sunny sunny" }
+      ]
+    }
+  ],
+  "songs": [
+    { "id": "/realdac-songs/honey-singh/blue-eyes.mp3", "name": "blue eyes" },
+    { "id": "/realdac-songs/honey-singh/brown-rang.mp3", "name": "brown rang" },
+    { "id": "/realdac-songs/honey-singh/char-bottle-vodka.mp3", "name": "char bottle vodka" },
+    { "id": "/realdac-songs/honey-singh/desi-kalakaar.mp3", "name": "desi kalakaar" },
+    { "id": "/realdac-songs/honey-singh/dheere-dheere.mp3", "name": "dheere dheere" },
+    { "id": "/realdac-songs/honey-singh/dope-shope.mp3", "name": "dope shope" },
+    { "id": "/realdac-songs/honey-singh/first-kiss.mp3", "name": "first kiss" },
+    { "id": "/realdac-songs/honey-singh/high-heels.mp3", "name": "high heels" },
+    { "id": "/realdac-songs/honey-singh/love-dose.mp3", "name": "love dose" },
+    { "id": "/realdac-songs/honey-singh/lungi-dance.mp3", "name": "lungi dance" },
+    { "id": "/realdac-songs/honey-singh/main-sharabi.mp3", "name": "main sharabi" },
+    { "id": "/realdac-songs/honey-singh/malamaal.mp3", "name": "malamaal" },
+    { "id": "/realdac-songs/honey-singh/millionaire.mp3", "name": "millionaire" },
+    { "id": "/realdac-songs/honey-singh/party-all-night.mp3", "name": "party all night" },
+    { "id": "/realdac-songs/honey-singh/rounds-n-ring.mp3", "name": "rounds n ring" },
+    { "id": "/realdac-songs/honey-singh/sunny-sunny.mp3", "name": "sunny sunny" }
+  ]
+}

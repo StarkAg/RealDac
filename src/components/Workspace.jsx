@@ -1,7 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { io } from 'socket.io-client';
+import { Capacitor } from '@capacitor/core';
 
+const SERVER_URL = Capacitor.isNativePlatform() ? 'https://realdac.gradex.bond' : '';
 const CODE_LENGTH = 6;
 
 function CodeSlots({ value, onChange, onComplete, autoFocus = true, disabled = false }) {
@@ -78,7 +80,7 @@ export default function Workspace() {
     let alive = true;
     const check = async () => {
       try {
-        const r = await fetch('/health', { cache: 'no-store' });
+        const r = await fetch(`${SERVER_URL}/health`, { cache: 'no-store' });
         if (!alive) return;
         setServerState(r.ok ? 'up' : 'down');
       } catch {
@@ -99,7 +101,7 @@ export default function Workspace() {
     // delaying — first paint is already done before this effect runs.
     (async () => {
       try {
-        const r = await fetch('/api/realdac/songs');
+        const r = await fetch('/songs.json');
         if (!r.ok || cancelled) return;
         const data = await r.json();
         const songs = Array.isArray(data?.songs) ? data.songs : [];
@@ -115,7 +117,7 @@ export default function Workspace() {
 
   const ensureSocket = useCallback(() => {
     if (socketRef.current && socketRef.current.connected) return socketRef.current;
-    const s = io({
+    const s = io(SERVER_URL, {
       path: '/realdac/socket.io',
       transports: ['websocket', 'polling'],
       reconnection: false,

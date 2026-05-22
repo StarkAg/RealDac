@@ -14,8 +14,11 @@ import { useSearchParams, useParams, useNavigate } from 'react-router-dom';
 import { useQuery, useMutation } from 'convex/react';
 import { api } from '../../convex/_generated/api';
 import { io } from 'socket.io-client';
+import { Capacitor } from '@capacitor/core';
 import QRCode from 'qrcode';
 import { log, warn } from '../lib/logger';
+
+const SERVER_URL = Capacitor.isNativePlatform() ? 'https://realdac.gradex.bond' : '';
 
 const DEFAULT_REALDAC_TRACK = '/realdac-songs/honey-singh/blue-eyes.mp3';
 const DEFAULT_REALDAC_ALBUM_ID = 'honey-singh';
@@ -375,7 +378,7 @@ export default function RealDac() {
   }, [reconnecting]);
 
   useEffect(() => {
-    fetch('/api/realdac/songs')
+    fetch('/songs.json')
       .then((r) => r.json())
       .then((data) => {
         const alb = data?.albums?.length > 0 ? data.albums : [FALLBACK_ALBUM];
@@ -764,7 +767,7 @@ export default function RealDac() {
         setTrackDurationMs(buffer.duration * 1000);
       } catch (e) {
         console.error('[RealDac] Failed to load playback track:', e);
-        setRoomStatus('Load failed');
+        setRoomStatus(`Load failed: ${e?.message || e}`);
         setSyncPhase('idle');
         setLoadingAudio(false);
         return;
@@ -881,7 +884,7 @@ export default function RealDac() {
   useEffect(() => {
     refreshSyncProfile();
     const profile = syncProfileRef.current;
-    const socket = io({
+    const socket = io(SERVER_URL, {
       path: '/realdac/socket.io',
       transports: ['websocket', 'polling'],
       reconnection: true,
@@ -1272,7 +1275,7 @@ export default function RealDac() {
       setRoomStatus('Ready');
     } catch (e) {
       console.error('[RealDac] Failed to load initial track:', e);
-      setRoomStatus('Load failed - tap Play to retry');
+      setRoomStatus(`Load failed: ${e?.message || e}`);
     } finally {
       setLoadingAudio(false);
       await syncTrackToConvex(roomCodeStr, trackToLoad, albumToUse, resolvedTrack.trackName);
@@ -1459,7 +1462,7 @@ export default function RealDac() {
         try {
           await loadBuffer(playableTrackId);
         } catch (e) {
-          setRoomStatus('Load failed - try again');
+          setRoomStatus(`Load failed: ${e?.message || e}`);
           setLoadingAudio(false);
           playButtonLockRef.current = false;
           setPlayButtonLocked(false);
